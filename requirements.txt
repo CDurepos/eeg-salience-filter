@@ -1,0 +1,7 @@
+kagglehub
+pandas
+python-dotenv
+numpy
+mne
+pywavelets
+scikit-learn
