@@ -11,6 +11,7 @@ To reproduce the experiments conducted for this project, you'll need an up-to-da
 To utilize this repository, first clone:
 
 `git clone https://github.com/CDurepos/eeg-salience-filter`
+
 `cd eeg-salience-filter`
 
 Install dependencies: 
