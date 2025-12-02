@@ -247,13 +247,15 @@ if __name__ == '__main__':
         all_subjects.append(subj_vec)
 
     # Stack all subjects together
-    X = np.vstack(all_X)
-    y = np.concatenate(all_y)
-    subjects = np.concatenate(all_subjects)
+    X = np.concatenate(all_X, axis=0)
+    y = np.concatenate(all_y, axis=0)
+    subject_ids = np.concatenate(all_subjects, axis=0)
 
-    print('Final feature matrix shape:', X.shape)   # (n_windows, n_features)
-    print('Label vector shape:', y.shape)          # (n_windows,)
-    print('Subject IDs shape:', subjects.shape)    # (n_windows,)
+    print("FINAL SHAPES:")
+    print("X shape:", X.shape)
+    print("y shape:", y.shape)
+    print("subject_ids shape:", subject_ids.shape)
+
 
     # Save to disk for downstream models
     out_dir = os.path.join('../data')
@@ -264,5 +266,5 @@ if __name__ == '__main__':
     np.save(os.path.join(out_dir, 'X_tqwt_wpd.npy'), X)
     np.save(os.path.join(out_dir, 'y_labels.npy'), y)
     
-    np.save(os.path.join(out_dir, 'subject_ids.npy'), subjects) # not completely sure it is necessary
+    np.save(os.path.join(out_dir, 'subject_ids.npy'), subject_ids)
     print("Completed the download")
