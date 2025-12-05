@@ -165,6 +165,13 @@ def extract_features_from_epochs(epochs: mne.Epochs, label: int, subject_id: str
 
     data = epochs.get_data()  # (n_epochs, n_channels, n_times)
     n_epochs, n_channels, n_times = data.shape
+    
+    # Compute features per channel (same for all channels)
+    # Use first epoch, first channel to determine feature size
+    sample_sig = data[0, 0, :]
+    tqwt_feats = extract_tqwt_features(sample_sig)
+    wpd_feats = extract_wpd_features(sample_sig)
+    features_per_channel = len(tqwt_feats) + len(wpd_feats)
 
     for i in range(n_epochs):
         epoch = data[i]  # (n_channels, n_times)
@@ -187,7 +194,7 @@ def extract_features_from_epochs(epochs: mne.Epochs, label: int, subject_id: str
     y = np.asarray(y_list)
     subjects = np.asarray(subj_list, dtype=object)
 
-    return X, y, subjects
+    return X, y, subjects, features_per_channel, epochs.ch_names
 
 
 def label_to_int(class_str: str) -> int:
@@ -238,13 +245,18 @@ if __name__ == '__main__':
         y_label = label_to_int(class_str)
 
         # Extract time–frequency features for each epoch
-        X_subj, y_subj, subj_vec = extract_features_from_epochs(
+        X_subj, y_subj, subj_vec, feats_per_ch, ch_names = extract_features_from_epochs(
             epochs, label=y_label, subject_id=subj_id
         )
 
         all_X.append(X_subj)
         all_y.append(y_subj)
         all_subjects.append(subj_vec)
+        
+        # Store channel info (should be same for all subjects, but we'll use first)
+        if 'channel_names' not in locals():
+            channel_names = ch_names
+            features_per_channel = feats_per_ch
 
     # Stack all subjects together
     X = np.concatenate(all_X, axis=0)
@@ -255,16 +267,22 @@ if __name__ == '__main__':
     print("X shape:", X.shape)
     print("y shape:", y.shape)
     print("subject_ids shape:", subject_ids.shape)
+    print(f"Number of channels: {len(channel_names)}")
+    print(f"Features per channel: {features_per_channel}")
+    print(f"Total features: {len(channel_names) * features_per_channel}")
+    print(f"Channel names: {channel_names}")
 
 
     # Save to disk for downstream models
-    out_dir = os.path.join('../data')
+    out_dir = os.path.join('data')
     os.makedirs(out_dir, exist_ok=True)
     
-    
-
     np.save(os.path.join(out_dir, 'X_tqwt_wpd.npy'), X)
     np.save(os.path.join(out_dir, 'y_labels.npy'), y)
-    
     np.save(os.path.join(out_dir, 'subject_ids.npy'), subject_ids)
-    print("Completed the download")
+    
+    # Save channel information for saliency analysis
+    np.save(os.path.join(out_dir, 'channel_names.npy'), np.array(channel_names, dtype=object))
+    np.save(os.path.join(out_dir, 'features_per_channel.npy'), np.array(features_per_channel))
+    
+    print("Completed the preprocessing")

@@ -15,6 +15,7 @@ print("Dataset saved at: ", path)
 EOF
 
 # Install tqwt_tools
-git clone https://github.com/jollyjonson/tqwt_tools.git
-cd tqwt_tools
+git clone https://github.com/jollyjonson/tqwt_tools.git src/tqwt_tools
+cd src/tqwt_tools
+pip install -r requirements.txt
 python setup.py install

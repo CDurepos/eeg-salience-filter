@@ -5,3 +5,5 @@ numpy
 mne
 pywavelets
 scikit-learn
+torch
+transformers
