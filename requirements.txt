@@ -7,3 +7,6 @@ pywavelets
 scikit-learn
 torch
 transformers
+typeguard
+scipy
+sortedcontainers
