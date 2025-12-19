@@ -16,7 +16,7 @@ from sklearn.preprocessing import StandardScaler
 
 # Add tqwt_tools to path if not installed as package
 _tqwt_tools_path = os.path.join(os.path.dirname(__file__), 'tqwt_tools')
-if _tqwt_tools_path not in sys.path:
+if os.path.exists(_tqwt_tools_path) and _tqwt_tools_path not in sys.path:
     sys.path.insert(0, _tqwt_tools_path)
 
 from tqwt_tools import tqwt
@@ -296,6 +296,7 @@ def run_pipeline(
     print(eeg_channels)
 
     all_X, all_y, all_subjects = [], [], []
+    all_epochs = []  # Store raw epochs for EEGNet
     channel_names = None
     features_per_channel = None
 
@@ -316,6 +317,7 @@ def run_pipeline(
         class_str = df_subj['Class'].iloc[0]
         y_label = label_to_int(class_str)
 
+        # Extract features (for compatibility)
         X_subj, y_subj, subj_vec, feats_per_ch, ch_names = extract_features_from_epochs(
             epochs, label=y_label, subject_id=subj_id
         )
@@ -323,6 +325,10 @@ def run_pipeline(
         all_X.append(X_subj)
         all_y.append(y_subj)
         all_subjects.append(subj_vec)
+        
+        # Store raw epochs: (n_epochs, n_channels, n_times)
+        epoch_data = epochs.get_data()
+        all_epochs.append(epoch_data)
 
         if channel_names is None:
             channel_names = ch_names
@@ -334,9 +340,11 @@ def run_pipeline(
     X = np.concatenate(all_X, axis=0)
     y = np.concatenate(all_y, axis=0)
     subject_ids = np.concatenate(all_subjects, axis=0)
+    epochs_raw = np.concatenate(all_epochs, axis=0)  # (n_epochs, n_channels, n_times)
 
     print("\nFINAL SHAPES:")
-    print("X shape:", X.shape)
+    print("X (features) shape:", X.shape)
+    print("Epochs (raw) shape:", epochs_raw.shape)
     print("y shape:", y.shape)
     print("subject_ids shape:", subject_ids.shape)
     print(f"Number of channels: {len(channel_names)}")
@@ -344,20 +352,28 @@ def run_pipeline(
     print(f"Total features: {len(channel_names) * features_per_channel}")
     print(f"Channel names: {channel_names}")
 
-    os.makedirs(out_dir, exist_ok=True)
+    # Save to unfiltered directory
+    unfiltered_dir = os.path.join(out_dir, 'unfiltered')
+    os.makedirs(unfiltered_dir, exist_ok=True)
 
-    np.save(os.path.join(out_dir, 'X_tqwt_wpd.npy'), X)
-    np.save(os.path.join(out_dir, 'y_labels.npy'), y)
-    np.save(os.path.join(out_dir, 'subject_ids.npy'), subject_ids)
-    np.save(os.path.join(out_dir, 'channel_names.npy'), np.array(channel_names, dtype=object))
-    np.save(os.path.join(out_dir, 'features_per_channel.npy'), np.array(features_per_channel))
+    # Save feature vectors (for compatibility)
+    np.save(os.path.join(unfiltered_dir, 'X_tqwt_wpd.npy'), X)
+    
+    # Save raw epochs (for EEGNet)
+    np.save(os.path.join(unfiltered_dir, 'epochs.npy'), epochs_raw)
+    
+    # Save labels and metadata
+    np.save(os.path.join(unfiltered_dir, 'y_labels.npy'), y)
+    np.save(os.path.join(unfiltered_dir, 'subject_ids.npy'), subject_ids)
+    np.save(os.path.join(unfiltered_dir, 'channel_names.npy'), np.array(channel_names, dtype=object))
+    np.save(os.path.join(unfiltered_dir, 'features_per_channel.npy'), np.array(features_per_channel))
 
     # Save config for reproducibility
-    with open(os.path.join(out_dir, 'preprocess_config.txt'), 'w') as f:
+    with open(os.path.join(unfiltered_dir, 'preprocess_config.txt'), 'w') as f:
         for k, v in cfg.__dict__.items():
             f.write(f"{k} = {v}\n")
 
-    print("\nCompleted preprocessing.")
+    print(f"\nCompleted preprocessing. Data saved to: {unfiltered_dir}/")
 
 
 # -----------------------------
@@ -368,8 +384,9 @@ def parse_args():
     p = argparse.ArgumentParser(description="ADHD EEG preprocessing + TQWT/WPD feature extraction")
 
     p.add_argument('--data-path', type=str, default=None,
-                   help="Path to adhdata.csv (overrides DATA_PATH env)")
-    p.add_argument('--out-dir', type=str, default='data')
+                   help="Path to adhdata.csv (overrides DATA_PATH from .env file)")
+    p.add_argument('--out-dir', type=str, default='data',
+                   help="Output directory for processed data (creates 'unfiltered/' subdirectory)")
 
     p.add_argument('--l-freq', type=float, default=1.0)
     p.add_argument('--h-freq', type=float, default=48.0)
@@ -395,7 +412,12 @@ if __name__ == '__main__':
 
     base_path = args.data_path
     if base_path is None:
-        base_dir = os.getenv('DATA_PATH', 'data')
+        base_dir = os.getenv('DATA_PATH')
+        if base_dir is None:
+            raise ValueError(
+                "DATA_PATH not found in environment. Please run bin/setup.sh first "
+                "or set DATA_PATH environment variable."
+            )
         base_path = os.path.join(base_dir, 'adhdata.csv')
 
     cfg = PreprocessConfig(
