@@ -1,3 +1,10 @@
+import sys
+print("interpreter path:", sys.executable)
+print("Search Paths:", sys.path)
+
+
+
+
 import os
 import sys
 import argparse

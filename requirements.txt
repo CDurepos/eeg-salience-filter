@@ -10,3 +10,5 @@ transformers
 typeguard
 scipy
 sortedcontainers
+tensorflow-metal==1.1.0
+tensorflow-macos==2.15.0

@@ -1,6 +1,8 @@
 .env
 data/
+outputs/
 
 .ipynb_checkpoints/
 
 src/tqwt_tools/
+arl-eegmodels/
