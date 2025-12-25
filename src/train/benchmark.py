@@ -1,205 +1,224 @@
+#!/usr/bin/env python3
 """
-Train a Benchmark EEGNet model on unfiltered data.
+Train Benchmark EEGNet Model (PyTorch + braindecode)
+
+This script trains a single EEGNet model on unfiltered data to serve as
+the baseline for comparing all teacher-student experiments.
+
+Uses braindecode's battle-tested EEGNet implementation.
+
+Usage:
+  python src/train/benchmark.py
 """
 
 import os
-import sys
 import numpy as np
-import tensorflow as tf
-from tensorflow import keras
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import train_test_split
+from braindecode.models import EEGNetv4
 from dotenv import load_dotenv
 
-# Add arl-eegmodels to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'arl-eegmodels'))
-from EEGModels import EEGNet
-
-# Load environment variables
 load_dotenv()
 
-# Configuration
-# Processed data is in project root data/ directories
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
 UNFILTERED_DATA_DIR = 'data/unfiltered'
-MODEL_DIR = 'models/benchmark'
-EPOCHS_FILE = 'epochs.npy'
-LABELS_FILE = 'y_labels.npy'
+MODEL_PATH = 'models/benchmark.pt'
+HISTORY_PATH = 'models/benchmark_history.npy'
 
-# Model parameters
 NB_CLASSES = 2
-CHANS = None  # Will be determined from data
-SAMPLES = 256
-DROPOUT_RATE = 0.5
-KERN_LENGTH = 64
-F1 = 8
-D = 2
-
-# Training parameters
-BATCH_SIZE = 32
+BATCH_SIZE = 128
 EPOCHS = 100
 LEARNING_RATE = 0.001
 VALIDATION_SPLIT = 0.2
+RANDOM_STATE = 42
+
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
-def load_data():
-    """Load unfiltered EEG epochs."""
-    epochs_path = os.path.join(UNFILTERED_DATA_DIR, EPOCHS_FILE)
-    labels_path = os.path.join(UNFILTERED_DATA_DIR, LABELS_FILE)
-    subject_ids_path = os.path.join(UNFILTERED_DATA_DIR, 'subject_ids.npy')
+# =============================================================================
+# TRAINING UTILITIES
+# =============================================================================
+
+def train_epoch(model, loader, criterion, optimizer):
+    """Train for one epoch."""
+    model.train()
+    total_loss, correct, total = 0, 0, 0
     
-    if not os.path.exists(epochs_path):
-        raise FileNotFoundError(
-            f"Epochs file not found: {epochs_path}\n"
-            "Please run preprocessing first: python src/preprocess.py"
-        )
+    for X_batch, y_batch in loader:
+        X_batch, y_batch = X_batch.to(DEVICE), y_batch.to(DEVICE)
+        
+        optimizer.zero_grad()
+        outputs = model(X_batch)
+        loss = criterion(outputs, y_batch)
+        loss.backward()
+        optimizer.step()
+        
+        total_loss += loss.item() * X_batch.size(0)
+        _, predicted = outputs.max(1)
+        correct += predicted.eq(y_batch).sum().item()
+        total += y_batch.size(0)
     
-    X = np.load(epochs_path)
-    y = np.load(labels_path)
-    subject_ids = np.load(subject_ids_path, allow_pickle=True) if os.path.exists(subject_ids_path) else None
-    
-    # Ensure correct shape for EEGNet: (batch, channels, time, 1)
-    if len(X.shape) == 3:
-        X = X[:, :, :, np.newaxis]
-    
-    print(f"Loaded original data: {X.shape}")
-    print(f"Labels: {y.shape}, unique: {np.unique(y)}")
-    if subject_ids is not None:
-        print(f"Subject IDs: {len(np.unique(subject_ids))} unique subjects")
-    
-    return X, y, subject_ids
+    return total_loss / total, correct / total
 
 
-def create_model(n_samples, n_channels):
-    """Create EEGNet model."""
-    model = EEGNet(
-        nb_classes=NB_CLASSES,
-        Chans=n_channels,
-        Samples=n_samples,
-        dropoutRate=DROPOUT_RATE,
-        kernLength=KERN_LENGTH,
-        F1=F1,
-        D=D,
-        dropoutType='Dropout'
-    )
+def evaluate(model, loader, criterion):
+    """Evaluate model."""
+    model.eval()
+    total_loss, correct, total = 0, 0, 0
     
-    model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=LEARNING_RATE),
-        loss='categorical_crossentropy',
-        metrics=['accuracy']
-    )
+    with torch.no_grad():
+        for X_batch, y_batch in loader:
+            X_batch, y_batch = X_batch.to(DEVICE), y_batch.to(DEVICE)
+            outputs = model(X_batch)
+            loss = criterion(outputs, y_batch)
+            
+            total_loss += loss.item() * X_batch.size(0)
+            _, predicted = outputs.max(1)
+            correct += predicted.eq(y_batch).sum().item()
+            total += y_batch.size(0)
     
-    return model
+    return total_loss / total, correct / total
 
+
+# =============================================================================
+# MAIN SCRIPT
+# =============================================================================
 
 def main():
     print("=" * 60)
-    print("Training Benchmark EEGNet Model (on Unfiltered Data)")
+    print("Training Benchmark EEGNet Model (PyTorch + braindecode)")
     print("=" * 60)
+    print(f"[Device] Using: {DEVICE}")
     
-    print("\nLoading unfiltered data...")
-    X, y, subject_ids = load_data()
+    # -------------------------------------------------------------------------
+    # Load data
+    # -------------------------------------------------------------------------
+    print("\n[Data] Loading unfiltered data...")
     
-    # Convert labels to categorical
-    y_categorical = keras.utils.to_categorical(y, num_classes=NB_CLASSES)
+    X = np.load(os.path.join(UNFILTERED_DATA_DIR, 'epochs.npy'))
+    y = np.load(os.path.join(UNFILTERED_DATA_DIR, 'y_labels.npy'))
+    subject_ids = np.load(os.path.join(UNFILTERED_DATA_DIR, 'subject_ids.npy'), allow_pickle=True)
     
-    # Split by subject to avoid data leakage (use same random state as other models)
-    if subject_ids is not None:
-        unique_subjects = np.unique(subject_ids)
-        # Get label for each subject (should be same for all segments)
-        subject_labels = np.array([y[subject_ids == subj][0] for subj in unique_subjects])
-        
-        train_subjects, test_subjects = train_test_split(
-            unique_subjects,
-            test_size=VALIDATION_SPLIT,
-            random_state=42,
-            stratify=subject_labels
-        )
-        
-        # Create masks
-        train_mask = np.isin(subject_ids, train_subjects)
-        test_mask = np.isin(subject_ids, test_subjects)
-        
-        X_train = X[train_mask]
-        X_test = X[test_mask]
-        y_train = y_categorical[train_mask]
-        y_test = y_categorical[test_mask]
-        
-        print(f"Split by subject: {len(train_subjects)} train subjects, {len(test_subjects)} test subjects")
-    else:
-        # Fallback to segment-level split if subject_ids not available
-        print("Warning: subject_ids not found, splitting by segment (may cause data leakage)")
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y_categorical,
-            test_size=VALIDATION_SPLIT,
-            random_state=42,
-            stratify=y
-        )
+    # braindecode expects (batch, channels, time)
+    if len(X.shape) == 4:
+        X = X[:, :, :, 0]
     
-    print(f"Train set: {X_train.shape}")
-    print(f"Test set: {X_test.shape}")
+    n_channels, n_samples = X.shape[1], X.shape[2]
+    print(f"[Data] Shape: {X.shape}, Subjects: {len(np.unique(subject_ids))}")
     
-    # Determine actual dimensions from data
-    actual_channels = X.shape[1]
-    actual_samples = X.shape[2]
+    # -------------------------------------------------------------------------
+    # Split by subject
+    # -------------------------------------------------------------------------
+    unique_subjects = np.unique(subject_ids)
+    subject_labels = [y[subject_ids == s][0] for s in unique_subjects]
     
-    print(f"\nData dimensions: {actual_channels} channels, {actual_samples} time points")
-    
-    # Create model
-    print("\nCreating Benchmark EEGNet model...")
-    model = create_model(actual_samples, actual_channels)
-    model.summary()
-    
-    # Callbacks
-    os.makedirs(MODEL_DIR, exist_ok=True)
-    model_path = os.path.join(MODEL_DIR, 'model.h5')
-    
-    callbacks = [
-        keras.callbacks.EarlyStopping(
-            monitor='val_loss',
-            patience=10,
-            restore_best_weights=True,
-            verbose=1
-        ),
-        keras.callbacks.ReduceLROnPlateau(
-            monitor='val_loss',
-            factor=0.5,
-            patience=5,
-            min_lr=1e-7,
-            verbose=1
-        ),
-        keras.callbacks.ModelCheckpoint(
-            model_path,
-            monitor='val_loss',
-            save_best_only=True,
-            verbose=1
-        )
-    ]
-    
-    # Train
-    print("\nTraining Benchmark model...")
-    history = model.fit(
-        X_train, y_train,
-        batch_size=BATCH_SIZE,
-        epochs=EPOCHS,
-        validation_data=(X_test, y_test),
-        callbacks=callbacks,
-        verbose=1
+    train_subj, test_subj = train_test_split(
+        unique_subjects, test_size=VALIDATION_SPLIT,
+        random_state=RANDOM_STATE, stratify=subject_labels
     )
     
-    # Evaluate
-    print("\nEvaluating Benchmark model on test set...")
-    test_loss, test_acc = model.evaluate(X_test, y_test, verbose=0)
-    print(f"Benchmark Test loss: {test_loss:.4f}")
-    print(f"Benchmark Test accuracy: {test_acc:.4f}")
+    train_mask = np.isin(subject_ids, train_subj)
+    test_mask = np.isin(subject_ids, test_subj)
     
-    # Save final model
-    model.save(model_path)
-    print(f"\nBenchmark model saved to: {model_path}")
+    X_train, X_test = X[train_mask], X[test_mask]
+    y_train, y_test = y[train_mask], y[test_mask]
     
-    # Save training history
-    np.save(os.path.join(MODEL_DIR, 'history.npy'), history.history)
-    print("Training history saved.")
+    print(f"[Data] Train: {len(train_subj)} subjects, {X_train.shape[0]} segments")
+    print(f"[Data] Test: {len(test_subj)} subjects, {X_test.shape[0]} segments")
+    
+    # Convert to PyTorch tensors
+    X_train_t = torch.FloatTensor(X_train)
+    y_train_t = torch.LongTensor(y_train)
+    X_test_t = torch.FloatTensor(X_test)
+    y_test_t = torch.LongTensor(y_test)
+    
+    train_loader = DataLoader(
+        TensorDataset(X_train_t, y_train_t),
+        batch_size=BATCH_SIZE, shuffle=True
+    )
+    test_loader = DataLoader(
+        TensorDataset(X_test_t, y_test_t),
+        batch_size=BATCH_SIZE
+    )
+    
+    # -------------------------------------------------------------------------
+    # Build model
+    # -------------------------------------------------------------------------
+    print("\n[Model] Building EEGNet (braindecode)...")
+    
+    model = EEGNetv4(
+        n_chans=n_channels,
+        n_outputs=NB_CLASSES,
+        n_times=n_samples,
+        final_conv_length='auto',
+        drop_prob=0.5
+    ).to(DEVICE)
+    
+    print(f"[Model] Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-7
+    )
+    
+    # -------------------------------------------------------------------------
+    # Train
+    # -------------------------------------------------------------------------
+    os.makedirs('models', exist_ok=True)
+    
+    history = {'loss': [], 'accuracy': [], 'val_loss': [], 'val_accuracy': []}
+    best_val_loss = float('inf')
+    patience_counter = 0
+    
+    print(f"\n[Train] Training for up to {EPOCHS} epochs...")
+    
+    for epoch in range(EPOCHS):
+        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer)
+        val_loss, val_acc = evaluate(model, test_loader, criterion)
+        
+        scheduler.step(val_loss)
+        
+        history['loss'].append(train_loss)
+        history['accuracy'].append(train_acc)
+        history['val_loss'].append(val_loss)
+        history['val_accuracy'].append(val_acc)
+        
+        # Early stopping
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            torch.save(model.state_dict(), MODEL_PATH)
+        else:
+            patience_counter += 1
+        
+        if (epoch + 1) % 5 == 0 or epoch == 0:
+            print(f"  Epoch {epoch+1:3d}: loss={train_loss:.4f}, acc={train_acc:.4f}, "
+                  f"val_loss={val_loss:.4f}, val_acc={val_acc:.4f}")
+        
+        if patience_counter >= 10:
+            print(f"  Early stopping at epoch {epoch+1}")
+            break
+    
+    # -------------------------------------------------------------------------
+    # Final evaluation
+    # -------------------------------------------------------------------------
+    model.load_state_dict(torch.load(MODEL_PATH))
+    test_loss, test_acc = evaluate(model, test_loader, criterion)
+    
+    print(f"\n[Result] Test Loss: {test_loss:.4f}, Test Accuracy: {test_acc:.4f}")
+    
+    np.save(HISTORY_PATH, history)
+    
+    print(f"\n[Done] Saved to {MODEL_PATH}")
+    print("=" * 60)
 
 
 if __name__ == '__main__':
     main()
-

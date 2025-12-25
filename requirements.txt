@@ -1,12 +1,29 @@
+# Data & preprocessing
 kagglehub
 pandas
-python-dotenv
 numpy
+scipy
 mne
 pywavelets
 scikit-learn
-torch
-transformers
+
+# PyTorch ecosystem (pinned for compatibility)
+torch==2.7.1
+torchvision==0.22.1
+torchaudio==2.7.1
+
+# EEG & Time-series models
+braindecode<1.2         # EEGNet (avoid 1.2+ which needs torchaudio 2.9)
+tsai                    # ResNet1d, TST
+
+# Interpretability
+captum                  # PyTorch interpretability (Integrated Gradients)
+
+# Visualization
+matplotlib
+seaborn
+
+# Utils
+python-dotenv
 typeguard
-scipy
 sortedcontainers

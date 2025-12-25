@@ -1,375 +1,341 @@
+#!/usr/bin/env python3
 """
-Complete processing pipeline: Generate salience maps, create mask, and filter data.
+Generate Salience Maps and Filter Data (PyTorch + Captum)
 
 This script:
-1. Loads the Teacher model
-2. Generates salience maps using Integrated Gradients and SmoothGrad
+1. Loads a trained teacher model
+2. Generates salience maps using Captum's Integrated Gradients
 3. Creates a binary mask from salience maps
-4. Applies the mask to filter the data
-5. Saves filtered data to data/filtered/
+4. Applies neutral fill masking (per-channel mean, not hard zeros)
+5. Saves filtered data for student training
+
+IMPORTANT: Only uses TRAINING data for salience maps to avoid data leakage.
+
+Uses Captum (PyTorch's official interpretability library) for reliable
+gradient-based attribution methods.
+
+Usage:
+  python src/process.py --teacher eegnet
+  python src/process.py --teacher resnet --threshold 0.5
+  python src/process.py --teacher tst
 """
 
 import os
-import sys
-import numpy as np
-import tensorflow as tf
-from tensorflow import keras
+import argparse
 import json
+import numpy as np
+import torch
+from sklearn.model_selection import train_test_split
+from braindecode.models import EEGNetv4
+from tsai.models.ResNet import ResNet
+from tsai.models.TST import TST
+from captum.attr import IntegratedGradients, NoiseTunnel
 from dotenv import load_dotenv
 
-# Add arl-eegmodels to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'arl-eegmodels'))
-from EEGModels import EEGNet
-
-# Load environment variables
 load_dotenv()
 
-# Configuration
-# DATA_PATH from .env points to downloaded dataset directory
-# Processed data goes to project root data/ directories
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
 UNFILTERED_DATA_DIR = 'data/unfiltered'
-FILTERED_DATA_DIR = 'data/filtered'
-MODEL_DIR = 'models/teacher'
-OUTPUT_DIR = 'outputs'
 
-EPOCHS_FILE = 'epochs.npy'
-LABELS_FILE = 'y_labels.npy'
+# Salience parameters (reduced for memory efficiency)
+IG_STEPS = 20            # Integrated gradients steps
+SMOOTHGRAD_SAMPLES = 10  # SmoothGrad noise samples
+SMOOTHGRAD_NOISE = 0.15
+DEFAULT_THRESHOLD = 0.95
 
-# Model parameters (will be determined from data/model)
+VALIDATION_SPLIT = 0.2
+RANDOM_STATE = 42
 NB_CLASSES = 2
-DROPOUT_RATE = 0.5
-KERN_LENGTH = 64
-F1 = 8
-D = 2
 
-# Salience map parameters
-IG_STEPS = 50
-SMOOTHGRAD_SAMPLES = 50
-SMOOTHGRAD_NOISE_STD = 0.15
-N_SAMPLES_FOR_SALIENCE = None  # None = use all data, or specify number
-
-# Mask creation parameters
-SALIENCE_METHOD = 'both'  # 'ig', 'smoothgrad', or 'both'
-THRESHOLD_METHOD = 'percentile'  # 'percentile' or 'absolute'
-THRESHOLD_VALUE = 0.75  # For percentile: top 25% (0.75), for absolute: threshold value
-MIN_SALIENCE = 0.0  # Minimum salience value to consider
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
-def load_teacher_model(n_samples, n_channels):
-    """Load the trained Teacher model."""
-    model_path = os.path.join(MODEL_DIR, 'model.h5')
+# =============================================================================
+# MODEL LOADERS
+# =============================================================================
+
+def load_teacher_model(teacher_type, n_channels, n_samples):
+    """Load the trained teacher model."""
+    model_path = f'models/{teacher_type}/teacher.pt'
     
     if not os.path.exists(model_path):
         raise FileNotFoundError(
-            f"Teacher model not found: {model_path}\n"
-            "Please train the teacher model first: python src/train/teacher.py"
+            f"Teacher not found: {model_path}\n"
+            f"Train it: python src/train/teacher.py --model {teacher_type}"
         )
     
-    # Create and load model
-    model = EEGNet(
-        nb_classes=NB_CLASSES,
-        Chans=n_channels,
-        Samples=n_samples,
-        dropoutRate=DROPOUT_RATE,
-        kernLength=KERN_LENGTH,
-        F1=F1,
-        D=D,
-        dropoutType='Dropout'
-    )
+    # Build model architecture
+    if teacher_type == 'eegnet':
+        model = EEGNetv4(
+            n_chans=n_channels,
+            n_outputs=NB_CLASSES,
+            n_times=n_samples,
+            final_conv_length='auto',
+            drop_prob=0.5
+        )
+    elif teacher_type == 'resnet':
+        model = ResNet(c_in=n_channels, c_out=NB_CLASSES)
+    elif teacher_type == 'tst':
+        model = TST(
+            c_in=n_channels, c_out=NB_CLASSES, seq_len=n_samples,
+            n_layers=4, n_heads=4, d_model=64, d_ff=128,
+            dropout=0.1, fc_dropout=0.3
+        )
+    else:
+        raise ValueError(f"Unknown teacher type: {teacher_type}")
     
-    model.load_weights(model_path)
-    model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=0.001),
-        loss='categorical_crossentropy',
-        metrics=['accuracy']
-    )
+    # Load weights
+    checkpoint = torch.load(model_path, map_location=DEVICE)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.to(DEVICE)
+    model.eval()
     
-    print(f"Loaded Teacher model from {model_path}")
     return model
 
 
-def integrated_gradients(model, inputs, target_class=None, steps=50):
-    """Compute Integrated Gradients attributions."""
-    batch_size = inputs.shape[0]
-    baseline = np.zeros_like(inputs)
+# =============================================================================
+# SALIENCE COMPUTATION (using Captum)
+# =============================================================================
+
+def compute_salience_maps(model, X_data, batch_size=8, max_samples=2000):
+    """
+    Compute salience maps using Captum's Integrated Gradients with SmoothGrad.
     
-    if target_class is None:
-        predictions = model(inputs, training=False)
-        target_class = tf.argmax(predictions, axis=1).numpy()
+    Uses:
+    - Integrated Gradients: Reliable gradient-based attribution
+    - NoiseTunnel (SmoothGrad): Reduces noise by averaging over noisy inputs
     
-    alphas = np.linspace(0.0, 1.0, steps + 1)
-    attributions = np.zeros_like(inputs)
+    Note: Uses a subset of samples for efficiency. Salience maps are averaged
+    to create a global importance mask.
+    """
+    # Subsample for efficiency
+    if len(X_data) > max_samples:
+        idx = np.random.choice(len(X_data), max_samples, replace=False)
+        X_data = X_data[idx]
+        print(f"[Salience] Subsampled to {max_samples} samples for efficiency")
     
-    for i in range(steps):
-        alpha = alphas[i]
-        interpolated = baseline + alpha * (inputs - baseline)
+    print(f"[Salience] Computing attributions for {len(X_data)} samples...")
+    
+    # Set up Captum attribution methods
+    ig = IntegratedGradients(model)
+    nt = NoiseTunnel(ig)
+    
+    # Compute attributions in batches to manage memory
+    all_attributions = []
+    n_batches = (len(X_data) + batch_size - 1) // batch_size
+    
+    for i in range(n_batches):
+        start = i * batch_size
+        end = min((i + 1) * batch_size, len(X_data))
         
-        with tf.GradientTape() as tape:
-            tape.watch(interpolated)
-            outputs = model(interpolated, training=False)
-            
-            if isinstance(target_class, np.ndarray):
-                target_outputs = tf.gather_nd(
-                    outputs,
-                    tf.stack([tf.range(batch_size), target_class], axis=1)
-                )
-            else:
-                target_outputs = outputs[:, target_class]
+        X_batch = torch.FloatTensor(X_data[start:end]).to(DEVICE)
         
-        gradients = tape.gradient(target_outputs, interpolated)
-        attributions += gradients.numpy() / steps
-    
-    attributions = attributions * (inputs - baseline)
-    return attributions
-
-
-def smoothgrad(model, inputs, target_class=None, num_samples=50, noise_std=0.15):
-    """Compute SmoothGrad attributions."""
-    batch_size = inputs.shape[0]
-    input_range = np.max(inputs) - np.min(inputs)
-    noise_scale = noise_std * input_range
-    
-    if target_class is None:
-        predictions = model(inputs, training=False)
-        target_class = tf.argmax(predictions, axis=1).numpy()
-    
-    all_gradients = []
-    
-    for _ in range(num_samples):
-        noise = np.random.normal(0, noise_scale, size=inputs.shape).astype(np.float32)
-        noisy_inputs = inputs + noise
+        # Get targets for this batch
+        with torch.no_grad():
+            outputs = model(X_batch)
+            targets_batch = outputs.argmax(dim=1)
         
-        with tf.GradientTape() as tape:
-            tape.watch(noisy_inputs)
-            outputs = model(noisy_inputs, training=False)
-            
-            if isinstance(target_class, np.ndarray):
-                target_outputs = tf.gather_nd(
-                    outputs,
-                    tf.stack([tf.range(batch_size), target_class], axis=1)
-                )
-            else:
-                target_outputs = outputs[:, target_class]
+        # Compute attributions with SmoothGrad noise
+        attributions = nt.attribute(
+            X_batch,
+            nt_type='smoothgrad',
+            nt_samples=SMOOTHGRAD_SAMPLES,
+            stdevs=SMOOTHGRAD_NOISE,
+            baselines=torch.zeros_like(X_batch),
+            target=targets_batch,
+            n_steps=IG_STEPS
+        )
         
-        gradients = tape.gradient(target_outputs, noisy_inputs)
-        all_gradients.append(gradients.numpy())
+        all_attributions.append(attributions.cpu().numpy())
+        del X_batch, attributions  # Free memory
+        torch.cuda.empty_cache()
+        
+        if (i + 1) % 25 == 0 or i == 0:
+            print(f"  Batch {i+1}/{n_batches} complete")
     
-    attributions = np.mean(all_gradients, axis=0)
-    attributions = attributions * inputs
+    # Concatenate all batches
+    salience_maps = np.concatenate(all_attributions, axis=0)
     
-    return attributions
+    print(f"[Salience] Shape: {salience_maps.shape}")
+    print(f"[Salience] Range: [{salience_maps.min():.6f}, {salience_maps.max():.6f}]")
+    
+    return salience_maps
 
 
-def create_binary_mask(salience_maps, threshold_method, threshold_value):
-    """Create binary mask from salience maps."""
-    print(f"\nCreating binary mask using {threshold_method} method...")
+# =============================================================================
+# MASK APPLICATION
+# =============================================================================
+
+def create_global_mask(salience_maps, threshold):
+    """
+    Create a GLOBAL binary mask from salience maps.
     
-    if threshold_method == 'percentile':
-        threshold = np.percentile(salience_maps, threshold_value * 100)
-        print(f"Percentile threshold ({threshold_value * 100}%): {threshold:.6f}")
-    else:
-        threshold = threshold_value
-        print(f"Absolute threshold: {threshold:.6f}")
+    Instead of thresholding per-sample (which loses global patterns when averaged),
+    we first aggregate salience across samples, then threshold once.
     
-    mask = (salience_maps >= threshold).astype(np.float32)
+    Args:
+        salience_maps: (n_samples, n_channels, n_times) attribution values
+        threshold: percentile of data to MASK (e.g., 0.25 = mask bottom 25%)
     
-    if MIN_SALIENCE > 0:
-        mask = mask * (salience_maps >= MIN_SALIENCE).astype(np.float32)
+    Returns:
+        mask: (1, n_channels, n_times) binary mask where 1 = keep, 0 = mask
+    """
+    # Average absolute salience across all samples to get global importance
+    abs_salience = np.abs(salience_maps)
+    global_importance = np.mean(abs_salience, axis=0)  # (channels, times)
     
-    total_elements = mask.size
-    important_elements = np.sum(mask)
-    percentage = (important_elements / total_elements) * 100
+    # Threshold: keep top (1-threshold) percent
+    thresh_val = np.percentile(global_importance, threshold * 100)
+    mask = (global_importance >= thresh_val).astype(np.float32)
     
-    print(f"Mask statistics:")
-    print(f"  Total elements: {total_elements:,}")
-    print(f"  Important (1): {important_elements:,} ({percentage:.2f}%)")
-    print(f"  Unimportant (0): {total_elements - important_elements:,} ({100 - percentage:.2f}%)")
+    kept = np.sum(mask) / mask.size * 100
+    print(f"[Mask] Threshold={threshold:.0%} → Kept: {kept:.1f}%, Masked: {100-kept:.1f}%")
     
-    return mask
+    return mask[np.newaxis, :, :]  # (1, channels, times)
 
 
-def apply_mask_to_data(data, mask):
-    """Apply binary mask to filter data."""
-    print("\nApplying mask to data...")
+def apply_mask(data, mask):
+    """
+    Apply mask using neutral fill (per-channel mean, not zeros).
     
+    Args:
+        data: (n_samples, n_channels, n_times) EEG data
+        mask: (1, n_channels, n_times) binary mask (1=keep, 0=mask)
+    
+    Returns:
+        filtered: (n_samples, n_channels, n_times) filtered data
+    """
+    # Ensure 3D
     if len(data.shape) == 4:
-        data_3d = data[:, :, :, 0]
-    else:
-        data_3d = data
+        data = data[:, :, :, 0]
     
-    if mask.shape != data_3d.shape:
-        if mask.shape[0] < data_3d.shape[0]:
-            n_repeat = data_3d.shape[0] // mask.shape[0]
-            mask = np.tile(mask, (n_repeat + 1, 1, 1))[:data_3d.shape[0]]
-            print(f"Expanded mask from {mask.shape} to {data_3d.shape}")
+    # Broadcast mask to all samples
+    mask_broadcast = np.broadcast_to(mask, data.shape)
     
-    filtered_data = data_3d * mask
+    # Per-channel mean as fill value (computed per sample, per channel)
+    channel_means = np.mean(data, axis=2, keepdims=True)
+    fill_values = np.broadcast_to(channel_means, data.shape)
     
-    if len(data.shape) == 4:
-        filtered_data = filtered_data[:, :, :, np.newaxis]
+    # Apply mask: keep original where mask=1, use channel mean where mask=0
+    filtered = np.where(mask_broadcast > 0.5, data, fill_values)
     
-    print(f"Filtered data shape: {filtered_data.shape}")
-    return filtered_data
+    return filtered
 
+
+# =============================================================================
+# MAIN SCRIPT
+# =============================================================================
 
 def main():
+    parser = argparse.ArgumentParser(description='Generate salience maps and filter data')
+    parser.add_argument('--teacher', type=str, required=True, choices=['eegnet', 'resnet', 'tst'])
+    parser.add_argument('--threshold', type=float, default=DEFAULT_THRESHOLD)
+    args = parser.parse_args()
+    
+    teacher_type = args.teacher
+    filtered_dir = f'data/filtered_{teacher_type}'
+    output_dir = f'outputs/{teacher_type}'
+    
     print("=" * 60)
-    print("Processing Pipeline: Salience Maps → Mask → Filtered Data")
+    print(f"Processing: {teacher_type.upper()} Teacher → Filtered Data")
     print("=" * 60)
+    print(f"[Device] Using: {DEVICE}")
+    print(f"[Config] Threshold: {args.threshold:.0%}")
     
-    # Load data first to get dimensions
-    print("\nLoading data to determine dimensions...")
-    epochs_path = os.path.join(UNFILTERED_DATA_DIR, EPOCHS_FILE)
-    if not os.path.exists(epochs_path):
-        raise FileNotFoundError(f"Epochs file not found: {epochs_path}")
+    # -------------------------------------------------------------------------
+    # Load data
+    # -------------------------------------------------------------------------
+    print("\n[Data] Loading...")
     
-    X_sample = np.load(epochs_path)
-    if len(X_sample.shape) == 3:
-        n_channels = X_sample.shape[1]
-        n_samples = X_sample.shape[2]
-    else:
-        n_channels = X_sample.shape[1]
-        n_samples = X_sample.shape[2]
+    X = np.load(os.path.join(UNFILTERED_DATA_DIR, 'epochs.npy'))
+    y = np.load(os.path.join(UNFILTERED_DATA_DIR, 'y_labels.npy'))
+    subject_ids = np.load(os.path.join(UNFILTERED_DATA_DIR, 'subject_ids.npy'), allow_pickle=True)
     
-    print(f"Data dimensions: {n_channels} channels, {n_samples} time points")
+    # Ensure shape is (batch, channels, time)
+    if len(X.shape) == 4:
+        X = X[:, :, :, 0]
     
-    # Load Teacher model
-    print("\nLoading Teacher model...")
-    model = load_teacher_model(n_samples, n_channels)
+    n_channels, n_samples = X.shape[1], X.shape[2]
+    print(f"[Data] Shape: {X.shape}")
     
-    # Load unfiltered data
-    print("\nLoading unfiltered data...")
-    epochs_path = os.path.join(UNFILTERED_DATA_DIR, EPOCHS_FILE)
-    labels_path = os.path.join(UNFILTERED_DATA_DIR, LABELS_FILE)
+    # -------------------------------------------------------------------------
+    # Split (same as training) - use only TRAIN data for salience
+    # -------------------------------------------------------------------------
+    unique_subjects = np.unique(subject_ids)
+    subject_labels = [y[subject_ids == s][0] for s in unique_subjects]
     
-    if not os.path.exists(epochs_path):
-        raise FileNotFoundError(f"Epochs file not found: {epochs_path}")
+    train_subj, _ = train_test_split(
+        unique_subjects, test_size=VALIDATION_SPLIT,
+        random_state=RANDOM_STATE, stratify=subject_labels
+    )
     
-    X = np.load(epochs_path)
-    y = np.load(labels_path)
+    train_mask = np.isin(subject_ids, train_subj)
+    X_train = X[train_mask]
     
-    # Ensure correct shape
-    if len(X.shape) == 3:
-        X = X[:, :, :, np.newaxis]
+    print(f"[Data] Using {X_train.shape[0]} TRAINING samples for salience (no leakage)")
     
-    print(f"Data shape: {X.shape}")
+    # -------------------------------------------------------------------------
+    # Load teacher
+    # -------------------------------------------------------------------------
+    print(f"\n[Model] Loading {teacher_type.upper()} teacher...")
+    model = load_teacher_model(teacher_type, n_channels, n_samples)
     
-    # Select samples for salience map generation
-    if N_SAMPLES_FOR_SALIENCE is not None and N_SAMPLES_FOR_SALIENCE < len(X):
-        indices = np.random.choice(len(X), N_SAMPLES_FOR_SALIENCE, replace=False)
-        X_salience = X[indices]
-        print(f"Using {N_SAMPLES_FOR_SALIENCE} samples for salience map generation")
-    else:
-        X_salience = X
-        print("Using all samples for salience map generation")
-    
+    # -------------------------------------------------------------------------
     # Generate salience maps
-    print("\n" + "=" * 60)
-    print("Generating Salience Maps")
-    print("=" * 60)
+    # -------------------------------------------------------------------------
+    print("\n[Salience] Computing attributions with Captum (IG + SmoothGrad)...")
+    salience_maps = compute_salience_maps(model, X_train)
     
-    ig_attributions = None
-    sg_attributions = None
+    # -------------------------------------------------------------------------
+    # Create mask and filter
+    # -------------------------------------------------------------------------
+    print("\n[Filter] Creating mask and filtering data...")
+    mask = create_global_mask(salience_maps, args.threshold)
+    X_filtered = apply_mask(X, mask)
     
-    if SALIENCE_METHOD in ['ig', 'both']:
-        print("\nComputing Integrated Gradients...")
-        ig_attributions = integrated_gradients(model, X_salience, steps=IG_STEPS)
-        if ig_attributions.shape[-1] == 1:
-            ig_attributions = ig_attributions[:, :, :, 0]
-        print(f"IG attributions shape: {ig_attributions.shape}")
+    print(f"[Filter] Original - mean: {np.mean(X):.4f}, std: {np.std(X):.4f}")
+    print(f"[Filter] Filtered - mean: {np.mean(X_filtered):.4f}, std: {np.std(X_filtered):.4f}")
     
-    if SALIENCE_METHOD in ['smoothgrad', 'both']:
-        print("\nComputing SmoothGrad...")
-        sg_attributions = smoothgrad(
-            model, X_salience,
-            num_samples=SMOOTHGRAD_SAMPLES,
-            noise_std=SMOOTHGRAD_NOISE_STD
-        )
-        if sg_attributions.shape[-1] == 1:
-            sg_attributions = sg_attributions[:, :, :, 0]
-        print(f"SmoothGrad attributions shape: {sg_attributions.shape}")
+    # -------------------------------------------------------------------------
+    # Save outputs
+    # -------------------------------------------------------------------------
+    print("\n[Save] Writing outputs...")
     
-    # Combine salience maps
-    if SALIENCE_METHOD == 'both' and ig_attributions is not None and sg_attributions is not None:
-        salience_maps = (np.abs(ig_attributions) + np.abs(sg_attributions)) / 2.0
-        print("\nCombined IG and SmoothGrad salience maps (averaged)")
-    elif ig_attributions is not None:
-        salience_maps = np.abs(ig_attributions)
-    else:
-        salience_maps = np.abs(sg_attributions)
+    os.makedirs(filtered_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
     
-    # Expand salience maps to full dataset if needed
-    if salience_maps.shape[0] < X.shape[0]:
-        # Create full salience map by repeating or interpolating
-        # For now, we'll use the average salience map for all samples
-        avg_salience = np.mean(salience_maps, axis=0, keepdims=True)
-        salience_maps = np.tile(avg_salience, (X.shape[0], 1, 1))
-        print(f"Expanded salience maps to full dataset: {salience_maps.shape}")
+    # Filtered data
+    np.save(f'{filtered_dir}/epochs.npy', X_filtered)
+    np.save(f'{filtered_dir}/y_labels.npy', y)
+    np.save(f'{filtered_dir}/subject_ids.npy', subject_ids)
+    print(f"[Save] Filtered data → {filtered_dir}/")
     
-    # Create binary mask
-    print("\n" + "=" * 60)
-    print("Creating Binary Mask")
-    print("=" * 60)
-    mask = create_binary_mask(salience_maps, THRESHOLD_METHOD, THRESHOLD_VALUE)
+    # Salience artifacts
+    np.save(f'{output_dir}/salience_maps.npy', salience_maps)
+    np.save(f'{output_dir}/binary_mask.npy', mask)
     
-    # Apply mask to filter data
-    print("\n" + "=" * 60)
-    print("Filtering Data")
-    print("=" * 60)
-    X_filtered = apply_mask_to_data(X, mask)
-    
-    # Save everything
-    os.makedirs(FILTERED_DATA_DIR, exist_ok=True)
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    
-    # Save filtered data
-    if len(X_filtered.shape) == 4:
-        X_filtered_3d = X_filtered[:, :, :, 0]
-    else:
-        X_filtered_3d = X_filtered
-    
-    # Load subject IDs from unfiltered data to save with filtered data
-    subject_ids_path = os.path.join(UNFILTERED_DATA_DIR, 'subject_ids.npy')
-    if os.path.exists(subject_ids_path):
-        subject_ids = np.load(subject_ids_path, allow_pickle=True)
-        np.save(os.path.join(FILTERED_DATA_DIR, 'subject_ids.npy'), subject_ids)
-        print(f"Subject IDs saved to filtered data")
-    
-    np.save(os.path.join(FILTERED_DATA_DIR, 'epochs.npy'), X_filtered_3d)
-    np.save(os.path.join(FILTERED_DATA_DIR, 'y_labels.npy'), y)
-    print(f"\nFiltered data saved to: {FILTERED_DATA_DIR}/")
-    
-    # Save salience maps
-    if ig_attributions is not None:
-        np.save(os.path.join(OUTPUT_DIR, 'ig_attributions.npy'), ig_attributions)
-    if sg_attributions is not None:
-        np.save(os.path.join(OUTPUT_DIR, 'smoothgrad_attributions.npy'), sg_attributions)
-    np.save(os.path.join(OUTPUT_DIR, 'combined_salience_maps.npy'), salience_maps)
-    
-    # Save mask
-    np.save(os.path.join(OUTPUT_DIR, 'binary_mask.npy'), mask)
-    
-    # Save processing metadata
-    metadata = {
-        'salience_method': SALIENCE_METHOD,
-        'threshold_method': THRESHOLD_METHOD,
-        'threshold_value': THRESHOLD_VALUE,
+    # Metadata
+    meta = {
+        'teacher': teacher_type,
+        'threshold': args.threshold,
+        'kept_percent': float(np.sum(mask) / mask.size * 100),
         'ig_steps': IG_STEPS,
         'smoothgrad_samples': SMOOTHGRAD_SAMPLES,
-        'mask_shape': list(mask.shape),
-        'important_percentage': float((np.sum(mask) / mask.size) * 100),
-        'filtered_data_shape': list(X_filtered_3d.shape)
+        'smoothgrad_noise': SMOOTHGRAD_NOISE,
+        'n_train_samples': len(X_train),
+        'salience_shape': list(salience_maps.shape)
     }
+    with open(f'{output_dir}/processing_meta.json', 'w') as f:
+        json.dump(meta, f, indent=2)
     
-    with open(os.path.join(OUTPUT_DIR, 'processing_metadata.json'), 'w') as f:
-        json.dump(metadata, f, indent=2)
-    
-    print(f"\nProcessing complete!")
-    print(f"  Filtered data: {FILTERED_DATA_DIR}/")
-    print(f"  Salience maps: {OUTPUT_DIR}/")
-    print(f"  Metadata: {OUTPUT_DIR}/processing_metadata.json")
+    print(f"[Save] Salience maps → {output_dir}/")
+    print("\n[Done]")
+    print("=" * 60)
 
 
 if __name__ == '__main__':
     main()
-

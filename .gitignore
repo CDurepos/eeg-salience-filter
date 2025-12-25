@@ -3,4 +3,11 @@ data/
 
 .ipynb_checkpoints/
 
+*/__pycache__/
+
 src/tqwt_tools/
+src/arl-eegmodels/
+
+plots/
+outputs
+models/
