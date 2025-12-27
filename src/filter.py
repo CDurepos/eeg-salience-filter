@@ -4,7 +4,9 @@ import os, sys, argparse
 from pathlib import Path
 import numpy as np
 import tensorflow as tf
+from tst_teacher import TransformerEncoderBlock
 
+# This script will filter all the models 
 
 def add_arl_eegmodels_to_path() -> Path:
     root = Path(__file__).resolve().parents[1]
@@ -72,7 +74,8 @@ def saliency_for_batch(
         elif mode == "true":
             if y_batch is None:
                 raise ValueError("mode='true' requires y_batch.")
-            cls = tf.cast(tf.convert_to_tensor(y_batch, dtype= tf.int32))
+            cls = tf.convert_to_tensor(y_batch, dtype=tf.int32)
+            cls = tf.reshape(cls, [-1])
         else:
             raise ValueError("mode must be 'pred' or 'true'.")
 
@@ -83,7 +86,8 @@ def saliency_for_batch(
     sal = tf.abs(grads)
 
     # Normalize per-trial to [0,1] to make thresholding more stable
-    sal = sal / (tf.reduce_max(sal, axis=[1, 2, 3], keepdims=True) + 1e-8)
+    reduce_axes = list(range(1, len(sal.shape)))
+    sal = sal / (tf.reduce_max(sal, axis=reduce_axes, keepdims=True) + 1e-8)
     return sal.numpy().astype(np.float32)
 
 
@@ -114,6 +118,19 @@ def make_mask_from_saliency(
     mask = (saliency >= thr).astype(np.float32)
     return mask
 
+def ts_to_eeg(X_ts: np.ndarray) -> np.ndarray:
+    """(N, Samples, Chans) -> (N, Chans, Samples, 1)"""
+    if X_ts.ndim != 3:
+        raise ValueError(f"Expected TS shape (N,Samples,Chans), got {X_ts.shape}")
+    X = np.transpose(X_ts, (0, 2, 1))       # (N, Chans, Samples)
+    return X[..., None]  
+
+def eeg_to_ts(X_eeg: np.ndarray) -> np.ndarray:
+    """(N, Chans, Samples, 1) -> (N, Samples, Chans)"""
+    if X_eeg.ndim != 4 or X_eeg.shape[-1] != 1:
+        raise ValueError(f"Expected EEG shape (N,Chans,Samples,1), got {X_eeg.shape}")
+    X = np.squeeze(X_eeg, axis=-1)          # (N, Chans, Samples)
+    return np.transpose(X, (0, 2, 1)) 
 
 def process_split(
     X: np.ndarray,
@@ -152,6 +169,7 @@ def process_split(
 
     return X_masked, mask
 
+# Main function to run the script for filtering the EEg student model
 
 def main():
     parser = argparse.ArgumentParser()
@@ -216,17 +234,20 @@ def main():
         mode=args.mode,
         keep_ratio=args.keep_ratio,
         per_trial=args.per_trial,
-        save_saliency=args.save_saliency,
+        save_saliency=args.save_saliency, 
         split_name="val",
         out_dir=out_dir
     )
+
+    subject_ids_train = d["subject_ids_train"]
+    subject_ids_val   = d["subject_ids_val"]
 
     # Save an NPZ ready for student training
     out_npz = out_dir / "epochs_subjectsplit_masked.npz"
     np.savez(
         out_npz,
-        X_train=X_train_masked, y_train=y_train,
-        X_val=X_val_masked, y_val=y_val,
+        X_train=X_train_masked, y_train=y_train, subject_ids_train=subject_ids_train,
+        X_val=X_val_masked, y_val=y_val, subject_ids_val=subject_ids_val,
         keep_ratio=args.keep_ratio,
         per_trial=args.per_trial,
         mode=args.mode,
@@ -238,5 +259,200 @@ def main():
     print("[INFO] Mask sparsity (val):  ", float(1.0 - val_mask.mean()))
 
 
+
+
+# Main function for running the Resnet model
+def main_resnet():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data", type=str, default="data/epochs_subjectsplit.npz")
+    parser.add_argument("--teacher", type=str, default="outputs/ResNet_best.keras")
+    parser.add_argument("--out", type=str, default="outputs/filtered_resnet")
+    parser.add_argument("--batch_size", type=int, default=128)
+
+    parser.add_argument("--keep_ratio", type=float, default=0.70, help="Keep top fraction of salient values, default is 70%")
+    parser.add_argument("--per_trial", action="store_true", help="Threshold per trial instead of global")
+
+    parser.add_argument("--mode", type=str, default="pred", choices=["pred", "true"],
+                        help="Use predicted class or true label when computing gradients")
+
+    parser.add_argument("--save_saliency", action="store_true", help="Also save full saliency arrays (large files!)")
+
+    # you can change these if your shapes differ
+    parser.add_argument("--chans", type=int, default=15)
+    parser.add_argument("--samples", type=int, default=60)
+
+    args = parser.parse_args()
+
+    set_tf_runtime()
+    root = add_arl_eegmodels_to_path()
+
+    
+
+    data_path = (root / args.data).resolve()
+    teacher_path = (root / args.teacher).resolve()
+    out_dir = (root / args.out).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+
+    d = np.load(data_path, allow_pickle=True)
+    X_train = d["X_train"].astype(np.float32)
+    y_train = d["y_train"].astype(int)
+    X_val = d["X_val"].astype(np.float32)
+    y_val = d["y_val"].astype(int)
+
+    # Shape checks (your target: (N,15,60,1))
+    assert_eegnet_shape(X_train, chans=args.chans, samples=args.samples)
+    assert_eegnet_shape(X_val, chans=args.chans, samples=args.samples)
+
+    # Load teacher + build logits model
+    teacher = tf.keras.models.load_model(teacher_path)
+    logits_model = build_logits_model(teacher)
+
+    # Build filtered splits
+    X_train_masked, train_mask = process_split(
+        X_train, y_train, logits_model,
+        batch_size=args.batch_size,
+        mode=args.mode,
+        keep_ratio=args.keep_ratio,
+        per_trial=args.per_trial,
+        save_saliency=args.save_saliency,
+        split_name="train",
+        out_dir=out_dir
+    )
+
+    X_val_masked, val_mask = process_split(
+        X_val, y_val, logits_model,
+        batch_size=args.batch_size,
+        mode=args.mode,
+        keep_ratio=args.keep_ratio,
+        per_trial=args.per_trial,
+        save_saliency=args.save_saliency,
+        split_name="val",
+        out_dir=out_dir
+    )
+    # subject ids aligned with the rows of X_train / X_val
+    subject_ids_train = d["subject_ids_train"]
+    subject_ids_val   = d["subject_ids_val"]
+
+    # Save an NPZ ready for student training
+    out_npz = out_dir / "epochs_resnet_subjectsplit_masked.npz"
+    np.savez(
+        out_npz,
+        X_train=X_train_masked, y_train=y_train, subject_ids_train=subject_ids_train,
+        X_val=X_val_masked, y_val=y_val, subject_ids_val=subject_ids_val,
+        keep_ratio=args.keep_ratio,
+        per_trial=args.per_trial,
+        mode=args.mode,
+    )
+
+    print("[DONE] Saved masked dataset:", out_npz)
+    print("[INFO] Example masked shape:", X_train_masked.shape)
+    print("[INFO] Mask sparsity (train):", float(1.0 - train_mask.mean()))
+    print("[INFO] Mask sparsity (val):  ", float(1.0 - val_mask.mean()))
+
+
+def main_Transformer():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data", type=str, default="data/epochs_subjectsplit.npz")
+    parser.add_argument("--teacher", type=str, default="outputs/teacher_transformer/teacher_best.keras")
+    parser.add_argument("--out", type=str, default="outputs/filtered_transformer")
+    parser.add_argument("--batch_size", type=int, default=128)
+
+    parser.add_argument("--keep_ratio", type=float, default=0.70, help="Keep top fraction of salient values, default is 70%")
+    parser.add_argument("--per_trial", action="store_true", help="Threshold per trial instead of global")
+
+    parser.add_argument("--mode", type=str, default="pred", choices=["pred", "true"],
+                        help="Use predicted class or true label when computing gradients")
+
+    parser.add_argument("--save_saliency", action="store_true", help="Also save full saliency arrays (large files!)")
+
+    # you can change these if your shapes differ
+    parser.add_argument("--chans", type=int, default=15)
+    parser.add_argument("--samples", type=int, default=60)
+
+    args = parser.parse_args()
+
+    set_tf_runtime()
+    root = add_arl_eegmodels_to_path()
+
+    
+    data_path = (root / args.data).resolve()
+    teacher_path = (root / args.teacher).resolve()
+    out_dir = (root / args.out).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+
+    d = np.load(data_path, allow_pickle=True)
+    X_train = d["X_train"].astype(np.float32)
+    y_train = d["y_train"].astype(int)
+    X_val = d["X_val"].astype(np.float32)
+    y_val = d["y_val"].astype(int)
+
+
+    # Load teacher + build logits model
+    teacher = tf.keras.models.load_model(
+    teacher_path,
+    custom_objects={"TransformerEncoderBlock": TransformerEncoderBlock},
+    compile=False
+    )
+    logits_model = build_logits_model(teacher)
+
+    # Convert EEGNet input -> Transformer input
+    X_train_ts = eeg_to_ts(X_train)   # (N, 60, 15)
+    X_val_ts   = eeg_to_ts(X_val)
+
+    # Build filtered splits
+    X_train_ts_masked, train_mask = process_split(
+        X_train_ts, y_train, logits_model,
+        batch_size=args.batch_size,
+        mode=args.mode,
+        keep_ratio=args.keep_ratio,
+        per_trial=args.per_trial,
+        save_saliency=args.save_saliency,
+        split_name="train",
+        out_dir=out_dir
+    )
+
+    X_val_ts_masked, val_mask = process_split(
+        X_val_ts, y_val, logits_model,
+        batch_size=args.batch_size,
+        mode=args.mode,
+        keep_ratio=args.keep_ratio,
+        per_trial=args.per_trial,
+        save_saliency=args.save_saliency,
+        split_name="val",
+        out_dir=out_dir
+    )
+
+    # convert back to eeg shape
+    X_train_masked = ts_to_eeg(X_train_ts_masked)  # (N, 15, 60, 1)
+    X_val_masked   = ts_to_eeg(X_val_ts_masked)
+
+
+    # subject ids aligned with the rows of X_train / X_val
+    subject_ids_train = d["subject_ids_train"]
+    subject_ids_val   = d["subject_ids_val"]
+
+    # Save an NPZ ready for student training
+    out_npz = out_dir / "epochs_transformer_subjectsplit_masked.npz"
+    np.savez(
+        out_npz,
+        X_train=X_train_masked, y_train=y_train, subject_ids_train=subject_ids_train,
+        X_val=X_val_masked, y_val=y_val, subject_ids_val=subject_ids_val,
+        keep_ratio=args.keep_ratio,
+        per_trial=args.per_trial,
+        mode=args.mode,
+    )
+
+    print("[DONE] Saved masked dataset:", out_npz)
+    print("[INFO] Example masked shape:", X_train_ts_masked.shape)
+    print("[INFO] Mask sparsity (train):", float(1.0 - train_mask.mean()))
+    print("[INFO] Mask sparsity (val):  ", float(1.0 - val_mask.mean()))
+    print("X_train_masked:", X_train_masked.shape)  # should be (N, 15, 60, 1)
+    print("X_val_masked:",   X_val_masked.shape)
+
+
+
+
 if __name__ == "__main__":
-    main()
+    main_Transformer()

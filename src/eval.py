@@ -56,7 +56,7 @@ def ensure_zero_based_labels(y: np.ndarray):
     y2 = np.array([mapping[v] for v in y], dtype=int)
     return y2, mapping
 
-
+#when plot is done without any processingg it ends up prodicing the row wise confusion matrix and when we want the subject wise confusion matrix we use the function below
 def plot_confusion_matrix(cm: np.ndarray, class_names: list[str], out_path: Path):
     fig = plt.figure()
     plt.imshow(cm)
@@ -75,6 +75,86 @@ def plot_confusion_matrix(cm: np.ndarray, class_names: list[str], out_path: Path
     fig.savefig(out_path, dpi=200)
     plt.close(fig)
 
+
+def save_confusion_matrix_png(cm: np.ndarray, class_names: list[str], out_path: Path, title: str):
+    fig = plt.figure()
+    plt.imshow(cm)
+    plt.title(title)
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    plt.xticks(range(len(class_names)), class_names, rotation=45, ha="right")
+    plt.yticks(range(len(class_names)), class_names)
+
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            plt.text(j, i, str(cm[i, j]), ha="center", va="center")
+
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
+
+def subjectwise_confusion_matrix(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    subject_ids: np.ndarray,
+    out_dir: str | Path,
+    labels: list[int] = (0, 1),
+    class_names: list[str] | None = None,
+    prefix: str = "subjectwise"
+):
+    """
+    Groups rows by subject_id, does majority-vote per subject, computes confusion matrix.
+    Saves:
+      - {prefix}_confusion_matrix_subject.npy
+      - {prefix}_confusion_matrix_subject.png
+    """
+    y_true = np.asarray(y_true).reshape(-1).astype(int)
+    y_pred = np.asarray(y_pred).reshape(-1).astype(int)
+    subject_ids = np.asarray(subject_ids).reshape(-1)
+
+    if not (len(y_true) == len(y_pred) == len(subject_ids)):
+        raise ValueError("y_true, y_pred, subject_ids must be the same length and row-aligned.")
+
+    subjects = np.unique(subject_ids)
+    subj_true = []
+    subj_pred = []
+
+    for s in subjects:
+        idx = (subject_ids == s)
+
+        # true label per subject (should be consistent; use vote to be safe)
+        t = y_true[idx]
+        true_label = np.bincount(t).argmax()
+
+        # predicted label per subject
+        p = y_pred[idx]
+        pred_label = np.bincount(p).argmax()
+
+        subj_true.append(true_label)
+        subj_pred.append(pred_label)
+
+    subj_true = np.array(subj_true, dtype=int)
+    subj_pred = np.array(subj_pred, dtype=int)
+
+    cm = confusion_matrix(subj_true, subj_pred, labels=list(labels))
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    np.save(out_dir / f"{prefix}_confusion_matrix_subject.npy", cm)
+
+    if class_names is None:
+        class_names = [str(l) for l in labels]
+
+    save_confusion_matrix_png(
+        cm,
+        class_names=class_names,
+        out_path=out_dir / f"{prefix}_confusion_matrix_subject.png",
+        title="Subject-wise Confusion Matrix"
+    )
+
+    return cm, subj_true, subj_pred, subjects
 
 def plot_per_class_bars(cm: np.ndarray, class_names: list[str], out_path: Path):
     support = cm.sum(axis=1)
@@ -101,7 +181,7 @@ def plot_per_class_bars(cm: np.ndarray, class_names: list[str], out_path: Path):
 
 
 
-# Main
+# Main for running the eegnet teacher student model
 
 def main():
     parser = argparse.ArgumentParser()
@@ -110,7 +190,6 @@ def main():
                         help="Masked dataset npz: X_train,y_train,X_val,y_val")
     parser.add_argument("--out", type=str, default="outputs/student_eval",
                         help="Output folder for model + plots")
-
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -267,7 +346,6 @@ def main():
 
 
     # Visualizations
-
     plot_confusion_matrix(cm, class_names, out_dir / "confusion_matrix.png")
     plot_per_class_bars(cm, class_names, out_dir / "per_class_accuracy.png")
 
@@ -275,6 +353,365 @@ def main():
     print(f"[DONE] Best:  {best_path}")
     print(f"[DONE] Final: {final_path}")
 
+#main for running the eegnet resnet model
+def main_resnet():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--data", type=str, default="outputs/filtered_resnet/epochs_resnet_subjectsplit_masked.npz",
+                        help="Masked dataset npz: X_train,y_train,X_val,y_val")
+    parser.add_argument("--out", type=str, default="outputs/student_Resnet_eval",
+                        help="Output folder for resnet model + plots")
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--lr", type=float, default=1e-3)
+
+    # Student capacity knobs (smaller than teacher)
+    parser.add_argument("--F1", type=int, default=8)
+    parser.add_argument("--D", type=int, default=2)
+    parser.add_argument("--dropout", type=float, default=0.5)
+    parser.add_argument("--kernLength", type=int, default=32)
+
+    args = parser.parse_args()
+
+    set_tf_runtime()
+    root = add_arl_eegmodels_to_path()
+
+    # Import EEGModels
+    from EEGModels import EEGNet
+
+    data_path = (root / args.data).resolve()
+    if not data_path.exists():
+        raise FileNotFoundError(f"Masked dataset not found: {data_path}")
+
+    out_dir = (root / args.out).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+   
+    # Load filtered / masked dataset
+
+    d = np.load(data_path, allow_pickle=True)
+    X_train = d["X_train"].astype(np.float32)
+    y_train = d["y_train"].astype(int)
+    X_val = d["X_val"].astype(np.float32)
+    y_val = d["y_val"].astype(int)
+
+    # Labels safety (won't change anything if already 0/1)
+    y_train, train_map = ensure_zero_based_labels(y_train)
+    y_val, _ = ensure_zero_based_labels(y_val)
+
+    # Shape checks
+    assert_eegnet_shape(X_train)
+    assert_eegnet_shape(X_val, chans=X_train.shape[1], samples=X_train.shape[2])
+
+    # NaN/Inf checks
+    if not np.isfinite(X_train).all():
+        raise ValueError("X_train contains NaN/Inf")
+    if not np.isfinite(X_val).all():
+        raise ValueError("X_val contains NaN/Inf")
+
+    Chans = int(X_train.shape[1])
+    Samples = int(X_train.shape[2])
+    nb_classes = int(np.max(y_train)) + 1
+
+    if args.kernLength > Samples:
+        print(f"[WARN] kernLength ({args.kernLength}) > Samples ({Samples}). Clamping to {Samples}.")
+        args.kernLength = Samples
+
+    print(f"[INFO] X_train: {X_train.shape} y_train: {y_train.shape} classes={nb_classes}")
+    print(f"[INFO] X_val:   {X_val.shape} y_val:   {y_val.shape}")
+    print("[INFO] Train class counts:", Counter(y_train))
+    print("[INFO] Val class counts:  ", Counter(y_val))
+    print("[INFO] Label map (train):", train_map)
+
+    # Class names for plots
+    class_names = [str(i) for i in range(nb_classes)]
+
+
+    # Build + Train student EEGNet
+
+    student = EEGNet(
+        nb_classes=nb_classes,
+        Chans=Chans,
+        Samples=Samples,
+        dropoutRate=args.dropout,
+        kernLength=args.kernLength,
+        F1=args.F1,
+        D=args.D,
+    )
+
+    student.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=args.lr),
+        loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=False),
+        metrics=["accuracy"],
+    )
+
+    best_path = out_dir / "student_best.keras"
+    final_path = out_dir / "student_final.keras"
+
+    callbacks = [
+        tf.keras.callbacks.ModelCheckpoint(
+            filepath=str(best_path),
+            monitor="val_accuracy",
+            save_best_only=True,
+            mode="max",
+        ),
+        tf.keras.callbacks.EarlyStopping(
+            monitor="val_accuracy",
+            patience=12,
+            restore_best_weights=True,
+            mode="max",
+        ),
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss",
+            factor=0.5,
+            patience=6,
+            min_lr=1e-6,
+        ),
+        tf.keras.callbacks.CSVLogger(str(out_dir / "train_resnet_log.csv"), append=False),
+    ]
+
+    history = student.fit(
+        X_train, y_train,
+        validation_data=(X_val, y_val),
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        callbacks=callbacks,
+        verbose=1,
+        shuffle=True
+    )
+
+    student.save(final_path)
+
+    # Predicts and Metrics
+
+    probs = student.predict(X_val, batch_size=args.batch_size, verbose=0)
+    y_pred = np.argmax(probs, axis=1)
+
+    acc = accuracy_score(y_val, y_pred)
+    cm = confusion_matrix(y_val, y_pred, labels=list(range(nb_classes)))
+    report = classification_report(y_val, y_pred, target_names=class_names, digits=4)
+
+    print("\n[VAL] accuracy:", acc)
+    print("\n[VAL] classification report:\n", report)
+
+    # Save metrics + history
+    with open(out_dir / "history.json", "w") as f:
+        json.dump({k: [float(x) for x in v] for k, v in history.history.items()}, f, indent=2)
+
+    with open(out_dir / "metrics.json", "w") as f:
+        json.dump({
+            "val_accuracy": float(acc),
+            "Chans": Chans,
+            "Samples": Samples,
+            "nb_classes": nb_classes,
+            "kernLength": args.kernLength,
+            "F1": args.F1,
+            "D": args.D,
+            "dropout": args.dropout,
+        }, f, indent=2)
+
+    with open(out_dir / "classification_report.txt", "w") as f:
+        f.write(report)
+
+    np.save(out_dir / "confusion_matrix.npy", cm)
+
+
+    # Visualizations
+    plot_confusion_matrix(cm, class_names, out_dir / "confusion_matrix.png")
+    subjectwise_confusion_matrix(
+        y_true=y_val,
+        y_pred=y_pred,
+        subject_ids=d["subject_ids_val"],
+        out_dir=out_dir,
+        class_names=class_names,
+        prefix="subjectwise"
+    )
+
+    plot_per_class_bars(cm, class_names, out_dir / "per_class_accuracy.png")
+
+    print(f"\n[DONE] Saved student model + eval artifacts to: {out_dir}")
+    print(f"[DONE] Best:  {best_path}")
+    print(f"[DONE] Final: {final_path}")
+
+#main for running the eegnet Transformer model
+def main_Transformer():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--data", type=str, default="outputs/filtered_transformer/epochs_transformer_subjectsplit_masked.npz",
+                        help="Masked dataset npz: X_train,y_train,X_val,y_val")
+    parser.add_argument("--out", type=str, default="outputs/student_Transformer_eval",
+                        help="Output folder for Transformer model + plots")
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--lr", type=float, default=1e-3)
+
+    # Student capacity knobs (smaller than teacher)
+    parser.add_argument("--F1", type=int, default=8)
+    parser.add_argument("--D", type=int, default=2)
+    parser.add_argument("--dropout", type=float, default=0.5)
+    parser.add_argument("--kernLength", type=int, default=32)
+
+    args = parser.parse_args()
+
+    set_tf_runtime()
+    root = add_arl_eegmodels_to_path()
+
+    # Import EEGModels
+    from EEGModels import EEGNet
+
+    data_path = (root / args.data).resolve()
+    if not data_path.exists():
+        raise FileNotFoundError(f"Masked dataset not found: {data_path}")
+
+    out_dir = (root / args.out).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+   
+    # Load filtered / masked dataset
+
+    d = np.load(data_path, allow_pickle=True)
+    X_train = d["X_train"].astype(np.float32)
+    y_train = d["y_train"].astype(int)
+    X_val = d["X_val"].astype(np.float32)
+    y_val = d["y_val"].astype(int)
+
+    # Labels safety (won't change anything if already 0/1)
+    y_train, train_map = ensure_zero_based_labels(y_train)
+    y_val, _ = ensure_zero_based_labels(y_val)
+
+    # Shape checks
+    assert_eegnet_shape(X_train)
+    assert_eegnet_shape(X_val, chans=X_train.shape[1], samples=X_train.shape[2])
+
+    # NaN/Inf checks
+    if not np.isfinite(X_train).all():
+        raise ValueError("X_train contains NaN/Inf")
+    if not np.isfinite(X_val).all():
+        raise ValueError("X_val contains NaN/Inf")
+
+    Chans = int(X_train.shape[1])
+    Samples = int(X_train.shape[2])
+    nb_classes = int(np.max(y_train)) + 1
+
+    if args.kernLength > Samples:
+        print(f"[WARN] kernLength ({args.kernLength}) > Samples ({Samples}). Clamping to {Samples}.")
+        args.kernLength = Samples
+
+    print(f"[INFO] X_train: {X_train.shape} y_train: {y_train.shape} classes={nb_classes}")
+    print(f"[INFO] X_val:   {X_val.shape} y_val:   {y_val.shape}")
+    print("[INFO] Train class counts:", Counter(y_train))
+    print("[INFO] Val class counts:  ", Counter(y_val))
+    print("[INFO] Label map (train):", train_map)
+
+    # Class names for plots
+    class_names = [str(i) for i in range(nb_classes)]
+
+
+    # Build + Train student EEGNet
+
+    student = EEGNet(
+        nb_classes=nb_classes,
+        Chans=Chans,
+        Samples=Samples,
+        dropoutRate=args.dropout,
+        kernLength=args.kernLength,
+        F1=args.F1,
+        D=args.D,
+    )
+
+    student.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=args.lr),
+        loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=False),
+        metrics=["accuracy"],
+    )
+
+    best_path = out_dir / "student_best.keras"
+    final_path = out_dir / "student_final.keras"
+
+    callbacks = [
+        tf.keras.callbacks.ModelCheckpoint(
+            filepath=str(best_path),
+            monitor="val_accuracy",
+            save_best_only=True,
+            mode="max",
+        ),
+        tf.keras.callbacks.EarlyStopping(
+            monitor="val_accuracy",
+            patience=12,
+            restore_best_weights=True,
+            mode="max",
+        ),
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss",
+            factor=0.5,
+            patience=6,
+            min_lr=1e-6,
+        ),
+        tf.keras.callbacks.CSVLogger(str(out_dir / "train_resnet_log.csv"), append=False),
+    ]
+
+    history = student.fit(
+        X_train, y_train,
+        validation_data=(X_val, y_val),
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        callbacks=callbacks,
+        verbose=1,
+        shuffle=True
+    )
+
+    student.save(final_path)
+
+    # Predicts and Metrics
+
+    probs = student.predict(X_val, batch_size=args.batch_size, verbose=0)
+    y_pred = np.argmax(probs, axis=1)
+
+    acc = accuracy_score(y_val, y_pred)
+    cm = confusion_matrix(y_val, y_pred, labels=list(range(nb_classes)))
+    report = classification_report(y_val, y_pred, target_names=class_names, digits=4)
+
+    print("\n[VAL] accuracy:", acc)
+    print("\n[VAL] classification report:\n", report)
+
+    # Save metrics + history
+    with open(out_dir / "history.json", "w") as f:
+        json.dump({k: [float(x) for x in v] for k, v in history.history.items()}, f, indent=2)
+
+    with open(out_dir / "metrics.json", "w") as f:
+        json.dump({
+            "val_accuracy": float(acc),
+            "Chans": Chans,
+            "Samples": Samples,
+            "nb_classes": nb_classes,
+            "kernLength": args.kernLength,
+            "F1": args.F1,
+            "D": args.D,
+            "dropout": args.dropout,
+        }, f, indent=2)
+
+    with open(out_dir / "classification_report.txt", "w") as f:
+        f.write(report)
+
+    np.save(out_dir / "confusion_matrix.npy", cm)
+
+
+    # Visualizations
+    plot_confusion_matrix(cm, class_names, out_dir / "confusion_matrix.png")
+    subjectwise_confusion_matrix(
+        y_true=y_val,
+        y_pred=y_pred,
+        subject_ids=d["subject_ids_val"],
+        out_dir=out_dir,
+        class_names=class_names,
+        prefix="subjectwise"
+    )
+
+    plot_per_class_bars(cm, class_names, out_dir / "per_class_accuracy.png")
+
+    print(f"\n[DONE] Saved student model + eval artifacts to: {out_dir}")
+    print(f"[DONE] Best:  {best_path}")
+    print(f"[DONE] Final: {final_path}")
 
 if __name__ == "__main__":
-    main()
+    main_Transformer()

@@ -21,7 +21,11 @@ sys.path.insert(0, str(EEGMODELS_DIR))
 from EEGModels import EEGNet
 
 #import trained data
-# split X and Y based on subjects 
+
+# ----------------------------
+# Preprocess data: # split X and Y based on subjects    
+# ----------------------------
+
 
 X = np.load("../data/X_tqwt_wpd.npy")
 y = np.load("../data/y_labels.npy")
@@ -41,6 +45,9 @@ train_subs, val_subs = train_test_split(
 
 train_mask = np.isin(subject_ids, train_subs)
 val_mask   = np.isin(subject_ids, val_subs)
+
+subject_ids_train = subject_ids[train_mask]
+subject_ids_val   = subject_ids[val_mask]
 
 X_train, y_train = X[train_mask], y[train_mask]
 X_val,   y_val   = X[val_mask],   y[val_mask]
@@ -85,12 +92,18 @@ X_val   = ensure_eegnet_shape(X_val, chans=X_train.shape[1])
 
 #print("EEGNet shapes:", X_train.shape, X_val.shape)  # (N, Chans, Samples, 1)
 np.savez("../data/epochs_subjectsplit.npz",
-         X_train=X_train, y_train=y_train,
-         X_val=X_val, y_val=y_val,
+         X_train=X_train, y_train=y_train, subject_ids_train=subject_ids_train,
+         X_val=X_val, y_val=y_val, subject_ids_val=subject_ids_val,
          train_subs=train_subs, val_subs=val_subs)
 
+print ("[DONE] Saved preprocessed data to ../data/epochs_subjectsplit.npz")
+#exit the script
+sys.exit()
 
-# Now we can actually train the teacher model
+
+# ----------------------------
+# Training the model: Now we can actually train the teacher model
+# ----------------------------
 
 def set_tf_runtime():
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
@@ -113,7 +126,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", type=str, default="data/epochs_subjectsplit.npz",
                         help="Path to .npz with X_train/y_train/X_val/y_val")
-    parser.add_argument("--out", type=str, default="outputs",
+    parser.add_argument("--out", type=str, default="outputs/eegnet_teacher",
                         help="Output directory")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=64)
