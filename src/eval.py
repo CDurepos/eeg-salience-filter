@@ -12,6 +12,7 @@ import tensorflow as tf
 
 from sklearn.metrics import confusion_matrix, classification_report, accuracy_score
 import matplotlib.pyplot as plt
+from typing import List, Dict
 
 
 
@@ -180,6 +181,93 @@ def plot_per_class_bars(cm: np.ndarray, class_names: list[str], out_path: Path):
     plt.close(fig)
 
 
+def plot_learning_curves(history: Dict[str, List[float]], out_path: Path):
+    """Plot train/val loss and accuracy from a Keras history-like dict.
+
+    `history` is expected to be a dict with keys like 'loss','val_loss','accuracy','val_accuracy'.
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    loss = history.get('loss', [])
+    val_loss = history.get('val_loss', [])
+    acc = history.get('accuracy', []) or history.get('acc', [])
+    val_acc = history.get('val_accuracy', [])
+
+    epochs = range(1, max(len(loss), len(val_loss), len(acc), len(val_acc)) + 1)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+    # Loss
+    if loss or val_loss:
+        axes[0].plot(epochs[:len(loss)], loss, label='train_loss')
+        axes[0].plot(epochs[:len(val_loss)], val_loss, label='val_loss')
+        axes[0].set_title('Loss')
+        axes[0].set_xlabel('Epoch')
+        axes[0].set_ylabel('Loss')
+        axes[0].legend()
+
+    # Accuracy
+    if acc or val_acc:
+        axes[1].plot(epochs[:len(acc)], acc, label='train_acc')
+        axes[1].plot(epochs[:len(val_acc)], val_acc, label='val_acc')
+        axes[1].set_title('Accuracy')
+        axes[1].set_xlabel('Epoch')
+        axes[1].set_ylabel('Accuracy')
+        axes[1].legend()
+
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
+
+def plot_metrics_heatmap(metrics_list: List[Dict[str, float]], labels: List[str], out_path: Path):
+    """Create a heatmap comparing numeric metrics across runs/pipelines.
+
+    `metrics_list` is a list of metric dicts (e.g. loaded from metrics.json).
+    `labels` are row labels for each dict.
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Collect numeric keys
+    all_keys = []
+    for m in metrics_list:
+        for k, v in m.items():
+            if isinstance(v, (int, float)) and k not in all_keys:
+                all_keys.append(k)
+
+    if not all_keys:
+        return
+
+    data = np.full((len(metrics_list), len(all_keys)), np.nan, dtype=float)
+    for i, m in enumerate(metrics_list):
+        for j, k in enumerate(all_keys):
+            v = m.get(k)
+            if isinstance(v, (int, float)):
+                data[i, j] = float(v)
+
+    fig, ax = plt.subplots(figsize=(max(6, len(all_keys) * 0.7), max(2, len(metrics_list) * 0.6)))
+    im = ax.imshow(data, aspect='auto', cmap='viridis')
+    ax.set_yticks(range(len(labels)))
+    ax.set_yticklabels(labels)
+    ax.set_xticks(range(len(all_keys)))
+    ax.set_xticklabels(all_keys, rotation=45, ha='right')
+
+    # annotate
+    for i in range(data.shape[0]):
+        for j in range(data.shape[1]):
+            v = data[i, j]
+            txt = '' if np.isnan(v) else f"{v:.3f}"
+            ax.text(j, i, txt, ha='center', va='center', color='white' if not np.isnan(v) and v < (np.nanmax(data) * 0.6) else 'black')
+
+    fig.colorbar(im, ax=ax)
+    plt.title('Metrics Heatmap')
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
+
 
 # Main for running the eegnet teacher student model
 
@@ -339,6 +427,19 @@ def main():
             "dropout": args.dropout,
         }, f, indent=2)
 
+    # Additional plots: learning curves + metrics heatmap
+    try:
+        plot_learning_curves({k: v for k, v in history.history.items()}, out_dir / "learning_curves.png")
+    except Exception:
+        pass
+
+    try:
+        with open(out_dir / "metrics.json", 'r') as mf:
+            metrics = json.load(mf)
+        plot_metrics_heatmap([metrics], [out_dir.name], out_dir / "metrics_heatmap.png")
+    except Exception:
+        pass
+
     with open(out_dir / "classification_report.txt", "w") as f:
         f.write(report)
 
@@ -348,6 +449,19 @@ def main():
     # Visualizations
     plot_confusion_matrix(cm, class_names, out_dir / "confusion_matrix.png")
     plot_per_class_bars(cm, class_names, out_dir / "per_class_accuracy.png")
+
+    # Additional plots for resnet
+    try:
+        plot_learning_curves({k: v for k, v in history.history.items()}, out_dir / "learning_curves.png")
+    except Exception:
+        pass
+
+    try:
+        with open(out_dir / "metrics.json", 'r') as mf:
+            metrics = json.load(mf)
+        plot_metrics_heatmap([metrics], [out_dir.name], out_dir / "metrics_heatmap.png")
+    except Exception:
+        pass
 
     print(f"\n[DONE] Saved student model + eval artifacts to: {out_dir}")
     print(f"[DONE] Best:  {best_path}")
@@ -529,6 +643,19 @@ def main_resnet():
 
     plot_per_class_bars(cm, class_names, out_dir / "per_class_accuracy.png")
 
+    # Additional plots for Transformer
+    try:
+        plot_learning_curves({k: v for k, v in history.history.items()}, out_dir / "learning_curves.png")
+    except Exception:
+        pass
+
+    try:
+        with open(out_dir / "metrics.json", 'r') as mf:
+            metrics = json.load(mf)
+        plot_metrics_heatmap([metrics], [out_dir.name], out_dir / "metrics_heatmap.png")
+    except Exception:
+        pass
+
     print(f"\n[DONE] Saved student model + eval artifacts to: {out_dir}")
     print(f"[DONE] Best:  {best_path}")
     print(f"[DONE] Final: {final_path}")
@@ -709,9 +836,44 @@ def main_Transformer():
 
     plot_per_class_bars(cm, class_names, out_dir / "per_class_accuracy.png")
 
+    # Additional plots for Transformer
+        # Additional plots for Transformer
+    try:
+        plot_learning_curves({k: v for k, v in history.history.items()}, out_dir / "learning_curves.png")
+    except Exception:
+        pass
+
+    try:
+        with open(out_dir / "metrics.json", 'r') as mf:
+            metrics = json.load(mf)
+        plot_metrics_heatmap([metrics], [out_dir.name], out_dir / "metrics_heatmap.png")
+    except Exception:
+        pass
+
+
     print(f"\n[DONE] Saved student model + eval artifacts to: {out_dir}")
     print(f"[DONE] Best:  {best_path}")
     print(f"[DONE] Final: {final_path}")
 
 if __name__ == "__main__":
-    main_Transformer()
+    # Allow selecting which student eval to run when called from the orchestrator.
+    import argparse
+
+    top = argparse.ArgumentParser(add_help=False)
+    top.add_argument('--which', choices=['eegnet', 'resnet', 'transformer', 'all'], default='all',
+                     help='Which student eval to run')
+    ns, remaining = top.parse_known_args()
+
+    import sys
+    sys_argv_backup = sys.argv
+    sys.argv = [sys.argv[0]] + remaining
+
+    try:
+        if ns.which in ('transformer', 'all'):
+            main_Transformer()
+        if ns.which in ('resnet', 'all'):
+            main_resnet()
+        if ns.which in ('eegnet', 'all'):
+            main()
+    finally:
+        sys.argv = sys_argv_backup

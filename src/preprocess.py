@@ -9,7 +9,9 @@ import os
 import sys
 import argparse
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Tuple, Optional
+
 
 import numpy as np
 import pandas as pd
@@ -20,6 +22,7 @@ import mne
 from mne.preprocessing import ICA
 
 from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
 
 # Add tqwt_tools to path if not installed as package
 _tqwt_tools_path = os.path.join(os.path.dirname(__file__), 'tqwt_tools')
@@ -286,6 +289,112 @@ def label_to_int(class_str: str) -> int:
 
 
 # -----------------------------
+# Helpers: shape normalization & subject split
+# -----------------------------
+
+def ensure_eegnet_shape(X: np.ndarray, chans: int = 15, samples: int = 60) -> np.ndarray:
+    """Ensure features match EEGNet expected shape (N,Chans,Samples,1).
+
+    Accepts flattened (N, C*S), (N,Chans,Samples), (N,Samples,Chans) or already
+    shaped arrays and returns a float32 array with final shape.
+    """
+    X = np.asarray(X)
+
+    # Case 1: flattened (N, C*S)
+    if X.ndim == 2:
+        if X.shape[1] != chans * samples:
+            raise ValueError(
+                f"Got flattened X with {X.shape[1]} features, expected {chans*samples}"
+            )
+        X = X.reshape(X.shape[0], chans, samples, 1)
+
+    # Case 2: (N,Chans,Samples) or (N,Samples,Chans)
+    elif X.ndim == 3:
+        if X.shape[1] == chans and X.shape[2] == samples:
+            X = X[..., np.newaxis]
+        elif X.shape[1] == samples and X.shape[2] == chans:
+            X = np.transpose(X, (0, 2, 1))[..., np.newaxis]
+        else:
+            # heuristic fallback
+            if X.shape[1] > X.shape[2]:
+                X = np.transpose(X, (0, 2, 1))
+            X = X[..., np.newaxis]
+
+    # Case 3: already (N,Chans,Samples,1)
+    elif X.ndim == 4:
+        if X.shape[-1] != 1:
+            raise ValueError(f"Expected last dim == 1, got shape {X.shape}")
+
+    else:
+        raise ValueError(f"Expected X.ndim in [2,3,4], got {X.ndim} with shape {X.shape}")
+
+    return X.astype(np.float32)
+
+
+def subject_split_and_save(
+    data_dir: str = "data",
+    out_path: str = "data/epochs_subjectsplit.npz",
+    test_size: float = 0.2,
+    random_state: int = 42,
+    chans: int = 15,
+    samples: int = 60,
+):
+    """Load feature npy files, split by subject, ensure shapes and save .npz.
+
+    Looks for `X_tqwt_wpd.npy`, `y_labels.npy`, `subject_ids.npy` under `data_dir`.
+    """
+    data_dir = Path(data_dir)
+    X_path = data_dir / "X_tqwt_wpd.npy"
+    y_path = data_dir / "y_labels.npy"
+    subj_path = data_dir / "subject_ids.npy"
+
+    if not X_path.exists() or not y_path.exists() or not subj_path.exists():
+        raise FileNotFoundError("Expected X_tqwt_wpd.npy, y_labels.npy, subject_ids.npy in data_dir")
+
+    X = np.load(X_path)
+    y = np.load(y_path)
+    subject_ids = np.load(subj_path, allow_pickle=True)
+
+    if not (len(X) == len(y) == len(subject_ids)):
+        raise ValueError("X/y/subject_ids must align on first dimension")
+
+    unique_subs = np.unique(subject_ids)
+    train_subs, val_subs = train_test_split(
+        unique_subs, test_size=test_size, random_state=random_state, shuffle=True
+    )
+
+    train_mask = np.isin(subject_ids, train_subs)
+    val_mask = np.isin(subject_ids, val_subs)
+
+    X_train, y_train = X[train_mask], y[train_mask]
+    X_val, y_val = X[val_mask], y[val_mask]
+
+    subject_ids_train = subject_ids[train_mask]
+    subject_ids_val = subject_ids[val_mask]
+
+    # Normalize shapes for EEGNet consumers
+    X_train = ensure_eegnet_shape(X_train, chans=chans, samples=samples)
+    X_val = ensure_eegnet_shape(X_val, chans=chans, samples=samples)
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    np.savez(
+        out_path,
+        X_train=X_train,
+        y_train=y_train,
+        subject_ids_train=subject_ids_train,
+        X_val=X_val,
+        y_val=y_val,
+        subject_ids_val=subject_ids_val,
+        train_subs=train_subs,
+        val_subs=val_subs,
+    )
+
+    return out_path
+
+
+# -----------------------------
 # Main pipeline
 # -----------------------------
 
@@ -422,4 +531,13 @@ if __name__ == '__main__':
         out_dir=args.out_dir,
         cfg=cfg,
         prefer_standard_19=not args.no_standard_19
+    )
+
+    subject_split_and_save(
+        data_dir=args.out_dir,
+        out_path=os.path.join(args.out_dir, 'epochs_subjectsplit.npz'),
+        test_size=0.2,
+        random_state=42,
+        chans=15,
+        samples=60,
     )

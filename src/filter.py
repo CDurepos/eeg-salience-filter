@@ -4,7 +4,7 @@ import os, sys, argparse
 from pathlib import Path
 import numpy as np
 import tensorflow as tf
-from tst_teacher import TransformerEncoderBlock
+from teacherModels.tst_teacher import TransformerEncoderBlock
 
 # This script will filter all the models 
 
@@ -453,6 +453,27 @@ def main_Transformer():
 
 
 
-
 if __name__ == "__main__":
-    main_Transformer()
+    # Support running only a specific filter pipeline when invoked from an orchestrator.
+    import argparse
+
+    top = argparse.ArgumentParser(add_help=False)
+    top.add_argument('--which', choices=['eegnet', 'resnet', 'transformer', 'all'], default='all',
+                     help='Which teacher filter to run')
+    ns, remaining = top.parse_known_args()
+
+    # Preserve remaining args for the specific runner functions
+    import sys
+    sys_argv_backup = sys.argv
+    sys.argv = [sys.argv[0]] + remaining
+
+    try:
+        if ns.which in ('resnet', 'all'):
+            main_resnet()
+        if ns.which in ('transformer', 'all'):
+            main_Transformer()
+        if ns.which in ('eegnet', 'all'):
+            main()
+    finally:
+        sys.argv = sys_argv_backup
+

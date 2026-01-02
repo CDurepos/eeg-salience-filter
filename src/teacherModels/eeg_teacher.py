@@ -8,97 +8,36 @@ from pathlib import Path
 
 import numpy as np 
 import tensorflow as tf
-from sklearn.model_selection import train_test_split
 from collections import Counter
 
 # its not packaged as python mdule by default
 import os, sys
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 EEGMODELS_DIR = ROOT / "arl-eegmodels"
+# Prefer adding the arl-eegmodels dir to sys.path so `from EEGModels import EEGNet` works
 sys.path.insert(0, str(EEGMODELS_DIR))
 
-from EEGModels import EEGNet
+try:
+    from EEGModels import EEGNet
+except Exception:
+    # Robust fallback: load the EEGModels.py file directly by path
+    import importlib.util
 
-#import trained data
+    eegmodels_path = EEGMODELS_DIR / "EEGModels.py"
+    if not eegmodels_path.exists():
+        raise FileNotFoundError(f"Could not find EEGModels.py at {eegmodels_path}")
 
-# ----------------------------
-# Preprocess data: # split X and Y based on subjects    
-# ----------------------------
+    spec = importlib.util.spec_from_file_location("EEGModels", str(eegmodels_path))
+    EEGModels = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(EEGModels)
+    EEGNet = EEGModels.EEGNet
 
+from pathlib import Path
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "src"))
 
-X = np.load("../data/X_tqwt_wpd.npy")
-y = np.load("../data/y_labels.npy")
-
-subject_ids = np.load("../data/subject_ids.npy", allow_pickle=True)
-
-assert len(X) == len(y) == len(subject_ids), "X/y/subject_ids must align on first dimension"
-
-unique_subs = np.unique(subject_ids)
-
-train_subs, val_subs = train_test_split(
-    unique_subs,
-    test_size=0.2,
-    random_state=42,
-    shuffle=True,
-)
-
-train_mask = np.isin(subject_ids, train_subs)
-val_mask   = np.isin(subject_ids, val_subs)
-
-subject_ids_train = subject_ids[train_mask]
-subject_ids_val   = subject_ids[val_mask]
-
-X_train, y_train = X[train_mask], y[train_mask]
-X_val,   y_val   = X[val_mask],   y[val_mask]
-
-# ensure EEGNet shape is correct
-def ensure_eegnet_shape(X, chans=15, samples=60):
-    X = np.asarray(X)
-
-    # Case 1: flattened (N, 900)
-    if X.ndim == 2:
-        if X.shape[1] != chans * samples:
-            raise ValueError(
-                f"Got flattened X with {X.shape[1]} features, expected {chans*samples} (= {chans}*{samples})."
-            )
-        X = X.reshape(X.shape[0], chans, samples, 1)
-
-    # Case 2: (N, Chans, Samples) or (N, Samples, Chans)
-    elif X.ndim == 3:
-        if X.shape[1] == chans and X.shape[2] == samples:
-            X = X[..., np.newaxis]
-        elif X.shape[1] == samples and X.shape[2] == chans:
-            X = np.transpose(X, (0, 2, 1))[..., np.newaxis]
-        else:
-            # fallback heuristic
-            if X.shape[1] > X.shape[2]:
-                X = np.transpose(X, (0, 2, 1))
-            X = X[..., np.newaxis]
-
-    # Case 3: already (N, Chans, Samples, 1)
-    elif X.ndim == 4:
-        if X.shape[-1] != 1:
-            raise ValueError(f"Expected last dim == 1, got shape {X.shape}")
-
-    else:
-        raise ValueError(f"Expected X.ndim in [2,3,4], got {X.ndim} with shape {X.shape}")
-
-    return X.astype(np.float32)
-
-
-X_train = ensure_eegnet_shape(X_train)
-X_val   = ensure_eegnet_shape(X_val, chans=X_train.shape[1])
-
-#print("EEGNet shapes:", X_train.shape, X_val.shape)  # (N, Chans, Samples, 1)
-np.savez("../data/epochs_subjectsplit.npz",
-         X_train=X_train, y_train=y_train, subject_ids_train=subject_ids_train,
-         X_val=X_val, y_val=y_val, subject_ids_val=subject_ids_val,
-         train_subs=train_subs, val_subs=val_subs)
-
-print ("[DONE] Saved preprocessed data to ../data/epochs_subjectsplit.npz")
-#exit the script
-sys.exit()
 
 
 # ----------------------------

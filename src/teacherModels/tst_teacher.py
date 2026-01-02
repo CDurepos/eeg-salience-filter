@@ -10,9 +10,6 @@ import tensorflow as tf
 from tensorflow.keras import layers, Model
 
 
-
-
-
 def set_tf_runtime():
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
     try:
