@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Simple orchestrator to run preprocessing, splitting, training, evaluation and prediction.
+"""  This is just a Simple orchestrator to run preprocessing, splitting, training, evaluation and prediction.
 
 Usage examples:
-  # Preprocess raw CSV -> feature files
+  # Preprocess raw CSV -> feature files (saved to data/)
   python src/run.py preprocess --data-path data/adhdata.csv --out-dir data
 
-  # Create subject split .npz (uses files in out-dir)
+  # Create subject split .npz (uses files in data-dir, saved to data/)
   python src/run.py split --data-dir data --out data/epochs_subjectsplit.npz
 
   # Train a teacher model script (path relative to repo root)
@@ -16,6 +16,9 @@ Usage examples:
 
   # Predict with a saved model on numpy data
   python src/run.py predict --model outputs/student_eval/student_best.keras --input data/X_sample.npy
+
+  # Run full pipeline (data files -> data/, model outputs -> outputs/run)
+  python src/run.py all
 """
 
 from __future__ import annotations
@@ -58,6 +61,10 @@ def run_split(data_dir: str, out_path: str, test_size: float = 0.2, seed: int = 
     sys.path.insert(0, str(REPO_ROOT / "src"))
     from preprocess import subject_split_and_save
 
+    # Ensure output directory exists
+    out_path_obj = Path(out_path)
+    out_path_obj.parent.mkdir(parents=True, exist_ok=True)
+
     out = subject_split_and_save(data_dir=data_dir, out_path=out_path, test_size=test_size, random_state=seed)
     print(f"Saved subject split to: {out}")
     return out
@@ -79,6 +86,8 @@ def run_train(model_script: str, extra_args: Optional[list] = None):
 
 def run_eval(data: str, out: str, extra_args: Optional[list] = None):
     script = REPO_ROOT / "src" / "eval.py"
+    # Ensure output directory exists
+    Path(out).mkdir(parents=True, exist_ok=True)
     cmd = [sys.executable, str(script), "--data", data, "--out", out]
     if extra_args:
         cmd += extra_args
@@ -160,8 +169,10 @@ def main():
     sall = sub.add_parser('all')
     sall.add_argument('--data-path', required=False, default=None,
                       help='Path to raw CSV (default: data/adhdata.csv if present)')
+    sall.add_argument('--data-dir', required=False, default=None,
+                      help='Directory for data files (preprocessing outputs, splits) (default: data)')
     sall.add_argument('--out-dir', required=False, default=None,
-                      help='Output directory root for this run (default: outputs/run)')
+                      help='Output directory root for model outputs (default: outputs/run)')
     sall.add_argument('--model-script', required=False, default=None,
                       help='Model script under src/ to run (default: teacherModels/eeg_teacher.py)')
 
@@ -182,15 +193,22 @@ def main():
         # Do not force a concrete CSV path here; let src/preprocess.py resolve DATA_PATH/defaults
         data_path = args.data_path
 
+        # Separate data directory for preprocessing outputs and splits
+        data_dir = args.data_dir or str(REPO_ROOT / 'data')
+        # Output directory for model outputs (trained models, evaluations, etc.)
         out_dir = args.out_dir or str(REPO_ROOT / 'outputs' / 'run')
         model_script = args.model_script or 'teacherModels/eeg_teacher.py'
 
         # preprocess -> split -> train -> eval
-        # ensure top-level out dir exists
+        # ensure directories exist
+        Path(data_dir).mkdir(parents=True, exist_ok=True)
         Path(out_dir).mkdir(parents=True, exist_ok=True)
-        run_preprocess(data_path, out_dir)
-        split_npz = str(Path(out_dir) / 'epochs_subjectsplit.npz')
-        run_split(out_dir, split_npz)
+        
+        # Run preprocessing - outputs go to data_dir
+        run_preprocess(data_path, data_dir)
+        # Split file goes to data_dir
+        split_npz = str(Path(data_dir) / 'epochs_subjectsplit.npz')
+        run_split(data_dir, split_npz)
 
         # Train & evaluate all teacher pipelines: EEGNet, ResNet, Transformer
         teachers = [

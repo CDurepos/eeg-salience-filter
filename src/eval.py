@@ -4,13 +4,15 @@ import os
 import sys
 import json
 import argparse
+import time
 from pathlib import Path
 from collections import Counter
 
 import numpy as np
 import tensorflow as tf
 
-from sklearn.metrics import confusion_matrix, classification_report, accuracy_score
+from sklearn.metrics import confusion_matrix, classification_report, accuracy_score, roc_curve, roc_auc_score
+from sklearn.preprocessing import label_binarize
 import matplotlib.pyplot as plt
 from typing import List, Dict
 
@@ -221,48 +223,53 @@ def plot_learning_curves(history: Dict[str, List[float]], out_path: Path):
     plt.close(fig)
 
 
-def plot_metrics_heatmap(metrics_list: List[Dict[str, float]], labels: List[str], out_path: Path):
-    """Create a heatmap comparing numeric metrics across runs/pipelines.
+def plot_roc_curve(y_true: np.ndarray, y_probs: np.ndarray, class_names: list[str], out_path: Path):
+    """Plot ROC curve(s) for binary or multi-class classification.
 
-    `metrics_list` is a list of metric dicts (e.g. loaded from metrics.json).
-    `labels` are row labels for each dict.
+    For binary classification: plots single ROC curve.
+    For multi-class: plots one-vs-rest ROC curves for each class.
+
+    Args:
+        y_true: True labels (shape: [n_samples])
+        y_probs: Predicted probabilities (shape: [n_samples, n_classes])
+        class_names: Names for each class
+        out_path: Path to save the plot
     """
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Collect numeric keys
-    all_keys = []
-    for m in metrics_list:
-        for k, v in m.items():
-            if isinstance(v, (int, float)) and k not in all_keys:
-                all_keys.append(k)
+    n_classes = len(class_names)
+    y_true = np.asarray(y_true).reshape(-1)
+    y_probs = np.asarray(y_probs)
 
-    if not all_keys:
-        return
+    if y_probs.shape[1] != n_classes:
+        raise ValueError(f"y_probs shape {y_probs.shape} doesn't match n_classes={n_classes}")
 
-    data = np.full((len(metrics_list), len(all_keys)), np.nan, dtype=float)
-    for i, m in enumerate(metrics_list):
-        for j, k in enumerate(all_keys):
-            v = m.get(k)
-            if isinstance(v, (int, float)):
-                data[i, j] = float(v)
+    fig, ax = plt.subplots(figsize=(8, 6))
 
-    fig, ax = plt.subplots(figsize=(max(6, len(all_keys) * 0.7), max(2, len(metrics_list) * 0.6)))
-    im = ax.imshow(data, aspect='auto', cmap='viridis')
-    ax.set_yticks(range(len(labels)))
-    ax.set_yticklabels(labels)
-    ax.set_xticks(range(len(all_keys)))
-    ax.set_xticklabels(all_keys, rotation=45, ha='right')
+    if n_classes == 2:
+        # Binary classification: single ROC curve
+        fpr, tpr, _ = roc_curve(y_true, y_probs[:, 1])
+        auc = roc_auc_score(y_true, y_probs[:, 1])
+        ax.plot(fpr, tpr, lw=2, label=f'{class_names[1]} (AUC = {auc:.3f})')
+    else:
+        # Multi-class: one-vs-rest approach
+        y_true_bin = label_binarize(y_true, classes=list(range(n_classes)))
+        
+        for i, class_name in enumerate(class_names):
+            if len(np.unique(y_true_bin[:, i])) > 1:  # Check if class has both positive and negative samples
+                fpr, tpr, _ = roc_curve(y_true_bin[:, i], y_probs[:, i])
+                auc = roc_auc_score(y_true_bin[:, i], y_probs[:, i])
+                ax.plot(fpr, tpr, lw=2, label=f'{class_name} (AUC = {auc:.3f})')
 
-    # annotate
-    for i in range(data.shape[0]):
-        for j in range(data.shape[1]):
-            v = data[i, j]
-            txt = '' if np.isnan(v) else f"{v:.3f}"
-            ax.text(j, i, txt, ha='center', va='center', color='white' if not np.isnan(v) and v < (np.nanmax(data) * 0.6) else 'black')
+    # Plot diagonal line (random classifier)
+    ax.plot([0, 1], [0, 1], 'k--', lw=1, label='Random (AUC = 0.500)')
 
-    fig.colorbar(im, ax=ax)
-    plt.title('Metrics Heatmap')
+    ax.set_xlabel('False Positive Rate', fontsize=12)
+    ax.set_ylabel('True Positive Rate', fontsize=12)
+    ax.set_title('ROC Curve', fontsize=14)
+    ax.legend(loc='lower right', fontsize=10)
+    ax.grid(alpha=0.3)
     plt.tight_layout()
     fig.savefig(out_path, dpi=200)
     plt.close(fig)
@@ -399,17 +406,27 @@ def main():
 
     student.save(final_path)
 
-    # Predicts and Metrics
-
+    # Predicts and Metrics with inference time measurement
+    start_time = time.time()
     probs = student.predict(X_val, batch_size=args.batch_size, verbose=0)
+    inference_time = time.time() - start_time
+    inference_time_per_sample = inference_time / len(X_val)
+    
     y_pred = np.argmax(probs, axis=1)
 
     acc = accuracy_score(y_val, y_pred)
     cm = confusion_matrix(y_val, y_pred, labels=list(range(nb_classes)))
     report = classification_report(y_val, y_pred, target_names=class_names, digits=4)
 
+    # Add inference time to classification report
+    report_with_time = report + f"\n\nInference Time:\n"
+    report_with_time += f"  Total time: {inference_time:.4f} seconds\n"
+    report_with_time += f"  Time per sample: {inference_time_per_sample*1000:.4f} ms\n"
+    report_with_time += f"  Number of samples: {len(X_val)}\n"
+
     print("\n[VAL] accuracy:", acc)
-    print("\n[VAL] classification report:\n", report)
+    print("\n[VAL] classification report:\n", report_with_time)
+    print(f"[VAL] Inference time: {inference_time:.4f}s ({inference_time_per_sample*1000:.4f} ms per sample)")
 
     # Save metrics + history
     with open(out_dir / "history.json", "w") as f:
@@ -418,6 +435,8 @@ def main():
     with open(out_dir / "metrics.json", "w") as f:
         json.dump({
             "val_accuracy": float(acc),
+            "inference_time_total_seconds": float(inference_time),
+            "inference_time_per_sample_ms": float(inference_time_per_sample * 1000),
             "Chans": Chans,
             "Samples": Samples,
             "nb_classes": nb_classes,
@@ -427,21 +446,19 @@ def main():
             "dropout": args.dropout,
         }, f, indent=2)
 
-    # Additional plots: learning curves + metrics heatmap
+    # Additional plots: learning curves + ROC curve
     try:
         plot_learning_curves({k: v for k, v in history.history.items()}, out_dir / "learning_curves.png")
     except Exception:
         pass
 
     try:
-        with open(out_dir / "metrics.json", 'r') as mf:
-            metrics = json.load(mf)
-        plot_metrics_heatmap([metrics], [out_dir.name], out_dir / "metrics_heatmap.png")
-    except Exception:
-        pass
+        plot_roc_curve(y_val, probs, class_names, out_dir / "roc_curve.png")
+    except Exception as e:
+        print(f"[WARN] Failed to plot ROC curve: {e}")
 
     with open(out_dir / "classification_report.txt", "w") as f:
-        f.write(report)
+        f.write(report_with_time)
 
     np.save(out_dir / "confusion_matrix.npy", cm)
 
@@ -449,19 +466,6 @@ def main():
     # Visualizations
     plot_confusion_matrix(cm, class_names, out_dir / "confusion_matrix.png")
     plot_per_class_bars(cm, class_names, out_dir / "per_class_accuracy.png")
-
-    # Additional plots for resnet
-    try:
-        plot_learning_curves({k: v for k, v in history.history.items()}, out_dir / "learning_curves.png")
-    except Exception:
-        pass
-
-    try:
-        with open(out_dir / "metrics.json", 'r') as mf:
-            metrics = json.load(mf)
-        plot_metrics_heatmap([metrics], [out_dir.name], out_dir / "metrics_heatmap.png")
-    except Exception:
-        pass
 
     print(f"\n[DONE] Saved student model + eval artifacts to: {out_dir}")
     print(f"[DONE] Best:  {best_path}")
@@ -596,17 +600,27 @@ def main_resnet():
 
     student.save(final_path)
 
-    # Predicts and Metrics
-
+    # Predicts and Metrics with inference time measurement
+    start_time = time.time()
     probs = student.predict(X_val, batch_size=args.batch_size, verbose=0)
+    inference_time = time.time() - start_time
+    inference_time_per_sample = inference_time / len(X_val)
+    
     y_pred = np.argmax(probs, axis=1)
 
     acc = accuracy_score(y_val, y_pred)
     cm = confusion_matrix(y_val, y_pred, labels=list(range(nb_classes)))
     report = classification_report(y_val, y_pred, target_names=class_names, digits=4)
 
+    # Add inference time to classification report
+    report_with_time = report + f"\n\nInference Time:\n"
+    report_with_time += f"  Total time: {inference_time:.4f} seconds\n"
+    report_with_time += f"  Time per sample: {inference_time_per_sample*1000:.4f} ms\n"
+    report_with_time += f"  Number of samples: {len(X_val)}\n"
+
     print("\n[VAL] accuracy:", acc)
-    print("\n[VAL] classification report:\n", report)
+    print("\n[VAL] classification report:\n", report_with_time)
+    print(f"[VAL] Inference time: {inference_time:.4f}s ({inference_time_per_sample*1000:.4f} ms per sample)")
 
     # Save metrics + history
     with open(out_dir / "history.json", "w") as f:
@@ -615,6 +629,8 @@ def main_resnet():
     with open(out_dir / "metrics.json", "w") as f:
         json.dump({
             "val_accuracy": float(acc),
+            "inference_time_total_seconds": float(inference_time),
+            "inference_time_per_sample_ms": float(inference_time_per_sample * 1000),
             "Chans": Chans,
             "Samples": Samples,
             "nb_classes": nb_classes,
@@ -625,7 +641,7 @@ def main_resnet():
         }, f, indent=2)
 
     with open(out_dir / "classification_report.txt", "w") as f:
-        f.write(report)
+        f.write(report_with_time)
 
     np.save(out_dir / "confusion_matrix.npy", cm)
 
@@ -643,18 +659,16 @@ def main_resnet():
 
     plot_per_class_bars(cm, class_names, out_dir / "per_class_accuracy.png")
 
-    # Additional plots for Transformer
+    # Additional plots: learning curves + ROC curve
     try:
         plot_learning_curves({k: v for k, v in history.history.items()}, out_dir / "learning_curves.png")
     except Exception:
         pass
 
     try:
-        with open(out_dir / "metrics.json", 'r') as mf:
-            metrics = json.load(mf)
-        plot_metrics_heatmap([metrics], [out_dir.name], out_dir / "metrics_heatmap.png")
-    except Exception:
-        pass
+        plot_roc_curve(y_val, probs, class_names, out_dir / "roc_curve.png")
+    except Exception as e:
+        print(f"[WARN] Failed to plot ROC curve: {e}")
 
     print(f"\n[DONE] Saved student model + eval artifacts to: {out_dir}")
     print(f"[DONE] Best:  {best_path}")
@@ -789,17 +803,27 @@ def main_Transformer():
 
     student.save(final_path)
 
-    # Predicts and Metrics
-
+    # Predicts and Metrics with inference time measurement
+    start_time = time.time()
     probs = student.predict(X_val, batch_size=args.batch_size, verbose=0)
+    inference_time = time.time() - start_time
+    inference_time_per_sample = inference_time / len(X_val)
+    
     y_pred = np.argmax(probs, axis=1)
 
     acc = accuracy_score(y_val, y_pred)
     cm = confusion_matrix(y_val, y_pred, labels=list(range(nb_classes)))
     report = classification_report(y_val, y_pred, target_names=class_names, digits=4)
 
+    # Add inference time to classification report
+    report_with_time = report + f"\n\nInference Time:\n"
+    report_with_time += f"  Total time: {inference_time:.4f} seconds\n"
+    report_with_time += f"  Time per sample: {inference_time_per_sample*1000:.4f} ms\n"
+    report_with_time += f"  Number of samples: {len(X_val)}\n"
+
     print("\n[VAL] accuracy:", acc)
-    print("\n[VAL] classification report:\n", report)
+    print("\n[VAL] classification report:\n", report_with_time)
+    print(f"[VAL] Inference time: {inference_time:.4f}s ({inference_time_per_sample*1000:.4f} ms per sample)")
 
     # Save metrics + history
     with open(out_dir / "history.json", "w") as f:
@@ -808,6 +832,8 @@ def main_Transformer():
     with open(out_dir / "metrics.json", "w") as f:
         json.dump({
             "val_accuracy": float(acc),
+            "inference_time_total_seconds": float(inference_time),
+            "inference_time_per_sample_ms": float(inference_time_per_sample * 1000),
             "Chans": Chans,
             "Samples": Samples,
             "nb_classes": nb_classes,
@@ -818,7 +844,7 @@ def main_Transformer():
         }, f, indent=2)
 
     with open(out_dir / "classification_report.txt", "w") as f:
-        f.write(report)
+        f.write(report_with_time)
 
     np.save(out_dir / "confusion_matrix.npy", cm)
 
@@ -836,19 +862,16 @@ def main_Transformer():
 
     plot_per_class_bars(cm, class_names, out_dir / "per_class_accuracy.png")
 
-    # Additional plots for Transformer
-        # Additional plots for Transformer
+    # Additional plots: learning curves + ROC curve
     try:
         plot_learning_curves({k: v for k, v in history.history.items()}, out_dir / "learning_curves.png")
     except Exception:
         pass
 
     try:
-        with open(out_dir / "metrics.json", 'r') as mf:
-            metrics = json.load(mf)
-        plot_metrics_heatmap([metrics], [out_dir.name], out_dir / "metrics_heatmap.png")
-    except Exception:
-        pass
+        plot_roc_curve(y_val, probs, class_names, out_dir / "roc_curve.png")
+    except Exception as e:
+        print(f"[WARN] Failed to plot ROC curve: {e}")
 
 
     print(f"\n[DONE] Saved student model + eval artifacts to: {out_dir}")
